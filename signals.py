@@ -2,6 +2,13 @@
 """
 signals.py — Options flow + news + politician signal scanner
 Final score = options_score (0-6) + news_score (0-2) + politician_score (0-3) — max 10
+
+Options scoring improvements (from community research):
+  - DTE-based weight: shorter DTE = stronger signal (urgency premium)
+  - OTM distance filter: deep OTM (>20%) = noise, near-OTM (1-10%) = high signal
+  - Min premium threshold: aggregate call premium must be meaningful
+  - Sweep detection: vol >> OI with large total volume = sweep signal
+  - MA trend filter: only score bullish options on MA5>MA10>MA20 uptrends
 """
 
 import json
@@ -11,6 +18,29 @@ import requests
 import yfinance as yf
 from datetime import datetime, timedelta, date
 import numpy as np
+import math
+
+def safe_int(val, default=0):
+    """Safe int conversion that handles NaN/None from yfinance options data."""
+    try:
+        import math
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return default
+        return int(val)
+    except Exception:
+        return default
+
+
+def safe_float(val, default=0.0):
+    """Safe float conversion."""
+    try:
+        import math
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return default
+        return float(val)
+    except Exception:
+        return default
+
 import sys
 import os
 
@@ -29,6 +59,13 @@ log = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POLITICIANS_LATEST = os.path.join(BASE_DIR, "knowledge", "politicians", "latest.json")
+
+# ── Options signal thresholds ────────────────────────────────────────────────
+MIN_OPTION_VOLUME = 250          # Ignore options with < 250 contracts (noise filter)
+MIN_AGGREGATE_PREMIUM = 50_000   # At least $50K aggregate premium to count
+MAX_OTM_PCT = 0.20               # Ignore options more than 20% OTM (lottery tickets)
+NEAR_OTM_MAX_PCT = 0.10          # Near-OTM: within 10% of current price
+SWEEP_VOL_MULTIPLIER = 5.0       # Vol > 5x OI = likely sweep (aggressive buyer)
 
 
 def load_politician_scores():
@@ -52,8 +89,83 @@ def load_politician_scores():
     return scores
 
 
+def get_ma_trend(tk, current_price):
+    """
+    Check MA5 > MA10 > MA20 bullish alignment (from stock_option_strategy).
+    Returns: 'bullish', 'bearish', or 'neutral'
+    """
+    try:
+        hist = tk.history(period="30d")
+        if hist.empty or len(hist) < 20:
+            return "neutral"
+        closes = hist["Close"].values
+        ma5 = closes[-5:].mean()
+        ma10 = closes[-10:].mean()
+        ma20 = closes[-20:].mean()
+        if ma5 > ma10 > ma20:
+            return "bullish"
+        elif ma5 < ma10 < ma20:
+            return "bearish"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
+def dte_score_multiplier(days_to_expiry):
+    """
+    DTE-based scoring weight (inspired by stock_option_strategy).
+    Shorter DTE = more aggressive/urgent bet = stronger signal.
+    """
+    if days_to_expiry <= 7:
+        return 1.4   # Extremely urgent
+    elif days_to_expiry <= 14:
+        return 1.3
+    elif days_to_expiry <= 21:
+        return 1.15
+    elif days_to_expiry <= 30:
+        return 1.0
+    else:
+        return 0.85  # Far-dated options = weaker signal
+
+
+def otm_quality_score(strike, current_price, is_call):
+    """
+    Score the OTM quality of an option.
+    Near-OTM (1-10% OTM) = highest quality signal.
+    Deep OTM (>20%) = noise, skip.
+    Returns: score multiplier (0 = skip, 0.5-1.5 = use)
+    """
+    if current_price <= 0:
+        return 1.0
+    if is_call:
+        otm_pct = (strike - current_price) / current_price
+    else:
+        otm_pct = (current_price - strike) / current_price
+
+    if otm_pct < 0:
+        return 0.7   # ITM — less signal value for flow detection
+    elif otm_pct > MAX_OTM_PCT:
+        return 0.0   # Deep OTM = lottery ticket, skip
+    elif otm_pct <= 0.05:
+        return 1.5   # Near-the-money = highest conviction
+    elif otm_pct <= NEAR_OTM_MAX_PCT:
+        return 1.2   # Moderate OTM = good signal
+    else:
+        return 0.8   # Further OTM = weaker signal
+
+
+def is_sweep(vol, oi):
+    """
+    Sweep detection: volume >> open interest means aggressive/directional buyer.
+    A sweep fills across multiple exchanges, leaving a large vol/OI footprint.
+    """
+    if oi == 0:
+        return vol > 1000  # No OI means fresh position — high vol = likely sweep
+    return vol > oi * SWEEP_VOL_MULTIPLIER
+
+
 def get_options_signal(ticker: str) -> dict:
-    """Pull options chain and score unusual flow."""
+    """Pull options chain and score unusual flow with improved logic."""
     try:
         tk = yf.Ticker(ticker)
         expirations = tk.options
@@ -66,7 +178,7 @@ def get_options_signal(ticker: str) -> dict:
             exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
             days_out = (exp_date - today).days
             if MIN_EXPIRY_DAYS <= days_out <= MAX_EXPIRY_DAYS:
-                valid_expiries.append(exp)
+                valid_expiries.append((exp, days_out))
 
         if not valid_expiries:
             return {"ticker": ticker, "options_score": 0, "direction": None, "detail": "no near-term expiry"}
@@ -78,65 +190,140 @@ def get_options_signal(ticker: str) -> dict:
         except Exception:
             pass
 
-        total_unusual_calls = 0
-        total_unusual_puts = 0
-        call_volume = 0
-        put_volume = 0
+        # Get MA trend for quality filter
+        ma_trend = get_ma_trend(tk, current_price)
+
+        total_call_score = 0.0
+        total_put_score = 0.0
+        total_call_premium = 0
+        total_put_premium = 0
+        sweep_calls = 0
+        sweep_puts = 0
         unusual_details = []
 
-        for exp in valid_expiries[:3]:
+        for exp, days_out in valid_expiries[:3]:
+            dte_mult = dte_score_multiplier(days_out)
             try:
                 chain = tk.option_chain(exp)
                 calls = chain.calls
                 puts = chain.puts
 
-                if current_price:
-                    otm_calls = calls[calls["strike"] > current_price * 1.01]
-                    otm_puts = puts[puts["strike"] < current_price * 0.99]
-                else:
-                    otm_calls = calls
-                    otm_puts = puts
+                # ── Score calls ──────────────────────────────────────────────
+                for _, row in calls.iterrows():
+                    vol = safe_int(row.get("volume"))
+                    oi = safe_int(row.get("openInterest"))
+                    ask = safe_float(row.get("ask", 0))
+                    strike = safe_float(row.get("strike", 0))
 
-                for _, row in otm_calls.iterrows():
-                    vol = row.get("volume", 0) or 0
-                    oi = row.get("openInterest", 0) or 0
-                    if oi > 0 and vol > oi * UNUSUAL_VOLUME_MULTIPLIER and vol > 100:
-                        total_unusual_calls += 1
-                        call_volume += vol
-                        unusual_details.append(f"CALL {row['strike']} exp={exp} vol={vol} oi={oi}")
+                    if vol < MIN_OPTION_VOLUME:
+                        continue
 
-                for _, row in otm_puts.iterrows():
-                    vol = row.get("volume", 0) or 0
-                    oi = row.get("openInterest", 0) or 0
-                    if oi > 0 and vol > oi * UNUSUAL_VOLUME_MULTIPLIER and vol > 100:
-                        total_unusual_puts += 1
-                        put_volume += vol
-                        unusual_details.append(f"PUT {row['strike']} exp={exp} vol={vol} oi={oi}")
+                    # OTM quality filter
+                    if current_price:
+                        otm_mult = otm_quality_score(strike, current_price, is_call=True)
+                        if otm_mult == 0:
+                            continue  # Skip deep OTM lottery tickets
+                    else:
+                        otm_mult = 1.0
+
+                    # Volume vs OI check
+                    unusual = (oi > 0 and vol > oi * UNUSUAL_VOLUME_MULTIPLIER) or \
+                              (oi == 0 and vol > 500)
+                    if not unusual:
+                        continue
+
+                    # Aggregate premium (vol * ask * 100 = notional value)
+                    notional = vol * ask * 100
+                    total_call_premium += notional
+
+                    # Base score: 1 + OTM quality + DTE weight
+                    row_score = 1.0 * otm_mult * dte_mult
+
+                    # Sweep bonus
+                    if is_sweep(vol, oi):
+                        sweep_calls += 1
+                        row_score *= 1.3
+                        unusual_details.append(f"SWEEP CALL {strike} exp={exp} vol={vol} oi={oi}")
+                    else:
+                        unusual_details.append(f"CALL {strike} exp={exp} vol={vol} oi={oi}")
+
+                    total_call_score += row_score
+
+                # ── Score puts ───────────────────────────────────────────────
+                for _, row in puts.iterrows():
+                    vol = safe_int(row.get("volume"))
+                    oi = safe_int(row.get("openInterest"))
+                    ask = safe_float(row.get("ask", 0))
+                    strike = safe_float(row.get("strike", 0))
+
+                    if vol < MIN_OPTION_VOLUME:
+                        continue
+
+                    if current_price:
+                        otm_mult = otm_quality_score(strike, current_price, is_call=False)
+                        if otm_mult == 0:
+                            continue
+                    else:
+                        otm_mult = 1.0
+
+                    unusual = (oi > 0 and vol > oi * UNUSUAL_VOLUME_MULTIPLIER) or \
+                              (oi == 0 and vol > 500)
+                    if not unusual:
+                        continue
+
+                    notional = vol * ask * 100
+                    total_put_premium += notional
+
+                    row_score = 1.0 * otm_mult * dte_mult
+                    if is_sweep(vol, oi):
+                        sweep_puts += 1
+                        row_score *= 1.3
+                        unusual_details.append(f"SWEEP PUT {strike} exp={exp} vol={vol} oi={oi}")
+                    else:
+                        unusual_details.append(f"PUT {strike} exp={exp} vol={vol} oi={oi}")
+
+                    total_put_score += row_score
 
             except Exception as e:
                 log.warning(f"{ticker} chain error for {exp}: {e}")
                 continue
 
+        # ── Compute final options score ─────────────────────────────────────
         options_score = 0
         direction = None
 
-        if total_unusual_calls > 0 or total_unusual_puts > 0:
-            net_bullish = total_unusual_calls - total_unusual_puts
-            if net_bullish > 0:
-                direction = "LONG"
-                options_score = min(6, 2 + total_unusual_calls + (1 if call_volume > 10000 else 0))
-            elif net_bullish < 0:
-                direction = "SHORT"
-                options_score = min(6, 2 + total_unusual_puts + (1 if put_volume > 10000 else 0))
+        net_call_score = total_call_score
+        net_put_score = total_put_score
+
+        # MA trend confirmation: boost aligned flow, penalize divergent flow
+        if ma_trend == "bullish" and net_call_score > net_put_score:
+            net_call_score *= 1.2
+        elif ma_trend == "bearish" and net_put_score > net_call_score:
+            net_put_score *= 1.2
+
+        # Minimum premium check — filter out low-notional noise
+        if net_call_score > net_put_score and total_call_premium >= MIN_AGGREGATE_PREMIUM:
+            direction = "LONG"
+            base_score = 2 + min(3, net_call_score)
+            sweep_bonus = min(1, sweep_calls * 0.5)
+            options_score = min(6, int(base_score + sweep_bonus))
+        elif net_put_score > net_call_score and total_put_premium >= MIN_AGGREGATE_PREMIUM:
+            direction = "SHORT"
+            base_score = 2 + min(3, net_put_score)
+            sweep_bonus = min(1, sweep_puts * 0.5)
+            options_score = min(6, int(base_score + sweep_bonus))
 
         return {
             "ticker": ticker,
             "options_score": options_score,
             "direction": direction,
-            "unusual_calls": total_unusual_calls,
-            "unusual_puts": total_unusual_puts,
-            "call_volume": call_volume,
-            "put_volume": put_volume,
+            "ma_trend": ma_trend,
+            "call_score": round(net_call_score, 2),
+            "put_score": round(net_put_score, 2),
+            "call_premium_est": int(total_call_premium),
+            "put_premium_est": int(total_put_premium),
+            "sweep_calls": sweep_calls,
+            "sweep_puts": sweep_puts,
             "current_price": current_price,
             "detail": "; ".join(unusual_details[:3]) if unusual_details else "no unusual flow"
         }
@@ -204,7 +391,7 @@ def get_news_score(ticker: str):
         return 0, "news error"
 
 
-def scan_all() -> list[dict]:
+def scan_all() -> list:
     """Scan all watchlist tickers and return scored signals."""
     log.info(f"Starting scan of {len(WATCHLIST)} tickers...")
     politician_scores = load_politician_scores()
@@ -217,7 +404,6 @@ def scan_all() -> list[dict]:
 
         news_score, top_headline = get_news_score(ticker)
 
-        # Politician score (capped at 3)
         pol_data = politician_scores.get(ticker, {})
         politician_score = pol_data.get("score", 0)
         politician_note = ""
@@ -226,15 +412,20 @@ def scan_all() -> list[dict]:
             names = ", ".join(p["name"] for p in pol_data.get("politicians", [])[:2])
             politician_note = f"{count} congressional buy(s): {names}"
 
-        # Final score: options (0-6) + news (0-2) + politician (0-3) = max 10
         options_score = opt_signal["options_score"]
         total_score = options_score + news_score + politician_score
         total_score = min(10, total_score)
 
         final_direction = opt_signal["direction"]
-        # If only politician signal, assume LONG
         if not final_direction and politician_score > 0:
             final_direction = "LONG"
+
+        ma_trend = opt_signal.get("ma_trend", "neutral")
+        sweep_note = ""
+        sc = opt_signal.get("sweep_calls", 0)
+        sp = opt_signal.get("sweep_puts", 0)
+        if sc > 0 or sp > 0:
+            sweep_note = f" 🌊 sweeps: {sc}C/{sp}P"
 
         signal = {
             "ticker": ticker,
@@ -244,9 +435,14 @@ def scan_all() -> list[dict]:
             "politician_score": round(politician_score, 2),
             "politician_note": politician_note,
             "direction": final_direction,
+            "ma_trend": ma_trend,
             "current_price": opt_signal.get("current_price"),
-            "unusual_calls": opt_signal.get("unusual_calls", 0),
-            "unusual_puts": opt_signal.get("unusual_puts", 0),
+            "call_score": opt_signal.get("call_score", 0),
+            "put_score": opt_signal.get("put_score", 0),
+            "call_premium_est": opt_signal.get("call_premium_est", 0),
+            "put_premium_est": opt_signal.get("put_premium_est", 0),
+            "sweep_calls": opt_signal.get("sweep_calls", 0),
+            "sweep_puts": opt_signal.get("sweep_puts", 0),
             "top_headline": top_headline,
             "options_detail": opt_signal.get("detail", ""),
             "tradeable": total_score >= MIN_SIGNAL_SCORE and final_direction is not None,
@@ -254,7 +450,10 @@ def scan_all() -> list[dict]:
         }
         signals.append(signal)
         pol_info = f" 🏛️ pol={politician_score}" if politician_score > 0 else ""
-        log.info(f"  {ticker}: score={total_score} opt={options_score} news={news_score}{pol_info} dir={final_direction}")
+        log.info(
+            f"  {ticker}: score={total_score} opt={options_score} news={news_score}"
+            f"{pol_info} dir={final_direction} ma={ma_trend}{sweep_note}"
+        )
 
     signals.sort(key=lambda x: x["score"], reverse=True)
     return signals
@@ -268,7 +467,11 @@ def main():
     log.info(f"Scan complete. {len(tradeable)}/{len(signals)} tickers tradeable (score >= {MIN_SIGNAL_SCORE})")
     for s in tradeable:
         pol = f" 🏛️ {s['politician_note']}" if s.get("politician_note") else ""
-        log.info(f"  ✅ {s['ticker']} score={s['score']} dir={s['direction']} price=${s['current_price']}{pol}")
+        sweep = f" 🌊 {s['sweep_calls']}C/{s['sweep_puts']}P sweeps" if (s.get('sweep_calls') or s.get('sweep_puts')) else ""
+        log.info(
+            f"  ✅ {s['ticker']} score={s['score']} dir={s['direction']} "
+            f"price=${s['current_price']} ma={s['ma_trend']}{pol}{sweep}"
+        )
 
     output = {
         "scanned_at": datetime.now().isoformat(),
