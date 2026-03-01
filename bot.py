@@ -38,6 +38,80 @@ log = logging.getLogger(__name__)
 TODAY = date.today().isoformat()
 LOG_FILE = os.path.join(TRADES_DIR, f"{TODAY}.json")
 
+TELEGRAM_CHAT_ID = "-5191423233"
+
+
+# ─── Telegram Notification ─────────────────────────────────────────────────────
+
+def send_telegram(text: str):
+    """Send a message to the Telegram group via OpenClaw CLI."""
+    try:
+        result = subprocess.run(
+            [
+                "openclaw", "message", "send",
+                "--channel", "telegram",
+                "--target", TELEGRAM_CHAT_ID,
+                "-m", text
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if result.returncode == 0:
+            log.info(f"Telegram sent OK")
+        else:
+            log.warning(f"Telegram send failed (rc={result.returncode}): {result.stderr[:200]}")
+    except Exception as e:
+        log.warning(f"Telegram send failed: {e}")
+
+
+def _held_duration(entry_time_iso: str) -> str:
+    """Return human-readable duration since entry."""
+    try:
+        entry_dt = datetime.fromisoformat(entry_time_iso)
+        delta = datetime.now() - entry_dt
+        total_minutes = int(delta.total_seconds() / 60)
+        if total_minutes < 60:
+            return f"{total_minutes}m"
+        hours = total_minutes // 60
+        mins = total_minutes % 60
+        return f"{hours}h {mins}m" if mins else f"{hours}h"
+    except Exception:
+        return "?"
+
+
+def _signal_labels(signal: dict) -> str:
+    """Summarize which signals fired (options/news/politician)."""
+    parts = []
+    if signal.get("options_score", 0) > 0:
+        parts.append("options")
+    if signal.get("news_score", 0) > 0:
+        parts.append("news")
+    if signal.get("politician_score", 0) > 0:
+        parts.append("politician")
+    return ", ".join(parts) if parts else "mixed"
+
+
+# ─── Trade Log Append ──────────────────────────────────────────────────────────
+
+def append_trade_event(event: dict):
+    """Append a timestamped trade event to today's JSON events log."""
+    os.makedirs(TRADES_DIR, exist_ok=True)
+    event["logged_at"] = datetime.now().isoformat()
+    events_file = os.path.join(TRADES_DIR, f"{TODAY}-events.json")
+    events = []
+    if os.path.exists(events_file):
+        try:
+            with open(events_file) as f:
+                events = json.load(f)
+        except Exception:
+            events = []
+    events.append(event)
+    with open(events_file, "w") as f:
+        json.dump(events, f, indent=2)
+
+
+# ─── Core helpers ──────────────────────────────────────────────────────────────
 
 def get_client():
     return TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
@@ -124,6 +198,8 @@ def submit_market_order(client, symbol: str, qty: float, side: str) -> dict:
     }
 
 
+# ─── Modes ─────────────────────────────────────────────────────────────────────
+
 def mode_open():
     """Load signals and execute trades at market open."""
     log.info("=== MODE: OPEN ===")
@@ -139,11 +215,25 @@ def mode_open():
         signal_data = json.load(f)
 
     tradeable = signal_data.get("tradeable", [])
+    all_signals = signal_data.get("signals", tradeable)
+
     if not tradeable:
         log.info("No tradeable signals today. No trades placed.")
         daily_log = load_today_log()
         daily_log["notes"] = "No tradeable signals"
         save_log(daily_log)
+
+        # Notify: no trades
+        account = get_account_info(client)
+        top = sorted(all_signals, key=lambda s: s.get("score", 0), reverse=True)[:5]
+        watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in top) if top else "none"
+        msg = (
+            f"📊 No trades today — no signals above threshold.\n"
+            f"Watching: {watching}\n"
+            f"💵 Cash: ${account['cash']:.2f}"
+        )
+        send_telegram(msg)
+        append_trade_event({"type": "no_trades", "watching": watching, "cash": account["cash"]})
         return
 
     account = get_account_info(client)
@@ -207,6 +297,8 @@ def mode_open():
             continue
 
         actual_cost = qty * price
+        stop_price = round(price * (1 + STOP_LOSS_PCT), 2)
+        target_price = round(price * (1 + TAKE_PROFIT_PCT), 2)
         log.info(f"Buying {qty} {symbol} @ ~${price:.2f} = ${actual_cost:.2f} ({position_pct*100:.0f}% of cash)")
 
         try:
@@ -218,8 +310,8 @@ def mode_open():
                 "entry_price": price,
                 "planned_qty": qty,
                 "planned_cost": actual_cost,
-                "stop_loss_price": round(price * (1 + STOP_LOSS_PCT), 2),
-                "take_profit_price": round(price * (1 + TAKE_PROFIT_PCT), 2),
+                "stop_loss_price": stop_price,
+                "take_profit_price": target_price,
                 "top_headline": signal.get("top_headline", ""),
                 "closed": False,
                 "exit_price": None,
@@ -229,6 +321,40 @@ def mode_open():
             daily_log["trades"].append(trade_record)
             available_cash -= actual_cost
             existing_positions.append({"symbol": symbol, "market_value": actual_cost})
+
+            # Refresh account cash after buy
+            try:
+                acct_refresh = get_account_info(client)
+                cash_remaining = acct_refresh["cash"]
+            except Exception:
+                cash_remaining = available_cash
+
+            # Telegram notification: BUY
+            score_val = signal.get("score", 0)
+            signals_fired = _signal_labels(signal)
+            msg = (
+                f"🟢 BUY EXECUTED — {symbol}\n"
+                f"📥 {qty} shares @ ${price:.2f}\n"
+                f"💰 Cost: ${actual_cost:.2f}\n"
+                f"🎯 Signal score: {score_val}/10 ({signals_fired})\n"
+                f"🛑 Stop: ${stop_price:.2f} | 🎯 Target: ${target_price:.2f}\n"
+                f"💵 Cash remaining: ${cash_remaining:.2f}"
+            )
+            send_telegram(msg)
+            append_trade_event({
+                "type": "buy",
+                "symbol": symbol,
+                "qty": qty,
+                "price": price,
+                "cost": actual_cost,
+                "score": score_val,
+                "signals_fired": signals_fired,
+                "stop_loss": stop_price,
+                "take_profit": target_price,
+                "cash_remaining": cash_remaining,
+                "order_id": order["order_id"]
+            })
+
             time.sleep(0.5)
         except Exception as e:
             log.error(f"Order failed for {symbol}: {e}")
@@ -254,18 +380,22 @@ def mode_monitor():
         symbol = pos["symbol"]
         plpc = pos["unrealized_plpc"]
         current_price = pos["current_price"]
+        unrealized_pl = pos["unrealized_pl"]
 
         log.info(f"{symbol}: current=${current_price:.2f} P&L%={plpc*100:.2f}%")
 
         should_close = False
         reason = ""
+        close_type = ""
 
         if plpc <= STOP_LOSS_PCT:
             should_close = True
             reason = f"stop loss hit ({plpc*100:.2f}%)"
+            close_type = "stop_loss"
         elif plpc >= TAKE_PROFIT_PCT:
             should_close = True
             reason = f"take profit hit ({plpc*100:.2f}%)"
+            close_type = "take_profit"
 
         if should_close:
             log.info(f"Closing {symbol}: {reason}")
@@ -273,16 +403,62 @@ def mode_monitor():
                 qty = abs(pos["qty"])
                 order = submit_market_order(client, symbol, qty, "SELL")
 
-                # Update trade log
+                # Find entry time from trade log
+                entry_time = None
                 for trade in daily_log["trades"]:
                     if trade["symbol"] == symbol and not trade["closed"]:
+                        entry_time = trade.get("submitted_at")
                         trade["closed"] = True
                         trade["exit_price"] = current_price
                         trade["close_reason"] = reason
-                        trade["pnl"] = pos["unrealized_pl"]
+                        trade["pnl"] = unrealized_pl
                         trade["pnl_pct"] = plpc * 100
                         trade["closed_at"] = datetime.now().isoformat()
                         break
+
+                held = _held_duration(entry_time) if entry_time else "?"
+                pnl_abs = abs(unrealized_pl)
+                pnl_pct_abs = abs(plpc * 100)
+
+                try:
+                    acct = get_account_info(client)
+                    cash = acct["cash"]
+                    portfolio = acct["portfolio_value"]
+                except Exception:
+                    cash = 0
+                    portfolio = 0
+
+                if close_type == "take_profit":
+                    msg = (
+                        f"✅ SOLD — {symbol} [TARGET HIT]\n"
+                        f"📤 {int(qty)} shares @ ${current_price:.2f}\n"
+                        f"📊 P&L: +${pnl_abs:.2f} (+{pnl_pct_abs:.1f}%)\n"
+                        f"⏱ Held: {held}\n"
+                        f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
+                    )
+                else:
+                    msg = (
+                        f"🔴 STOPPED OUT — {symbol}\n"
+                        f"📤 {int(qty)} shares @ ${current_price:.2f}\n"
+                        f"📊 P&L: -${pnl_abs:.2f} (-{pnl_pct_abs:.1f}%)\n"
+                        f"⏱ Held: {held}\n"
+                        f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
+                    )
+
+                send_telegram(msg)
+                append_trade_event({
+                    "type": close_type,
+                    "symbol": symbol,
+                    "qty": int(qty),
+                    "price": current_price,
+                    "pnl": unrealized_pl,
+                    "pnl_pct": plpc * 100,
+                    "held": held,
+                    "cash": cash,
+                    "portfolio": portfolio,
+                    "order_id": order["order_id"]
+                })
+
             except Exception as e:
                 log.error(f"Failed to close {symbol}: {e}")
 
@@ -306,6 +482,7 @@ def mode_close():
         qty = abs(pos["qty"])
         current_price = pos["current_price"]
         plpc = pos["unrealized_plpc"]
+        unrealized_pl = pos["unrealized_pl"]
 
         log.info(f"Closing {symbol}: {qty} shares @ ${current_price:.2f} ({plpc*100:.2f}%)")
         try:
@@ -316,10 +493,43 @@ def mode_close():
                     trade["closed"] = True
                     trade["exit_price"] = current_price
                     trade["close_reason"] = "EOD close"
-                    trade["pnl"] = pos["unrealized_pl"]
+                    trade["pnl"] = unrealized_pl
                     trade["pnl_pct"] = plpc * 100
                     trade["closed_at"] = datetime.now().isoformat()
                     break
+
+            try:
+                acct = get_account_info(client)
+                cash = acct["cash"]
+                portfolio = acct["portfolio_value"]
+            except Exception:
+                cash = 0
+                portfolio = 0
+
+            pnl_sign = "+" if unrealized_pl >= 0 else "-"
+            pnl_abs = abs(unrealized_pl)
+            pnl_pct_sign = "+" if plpc >= 0 else "-"
+            pnl_pct_abs = abs(plpc * 100)
+
+            msg = (
+                f"🔔 EOD CLOSE — {symbol}\n"
+                f"📤 {int(qty)} shares @ ${current_price:.2f}\n"
+                f"📊 P&L: {pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)\n"
+                f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
+            )
+            send_telegram(msg)
+            append_trade_event({
+                "type": "eod_close",
+                "symbol": symbol,
+                "qty": int(qty),
+                "price": current_price,
+                "pnl": unrealized_pl,
+                "pnl_pct": plpc * 100,
+                "cash": cash,
+                "portfolio": portfolio,
+                "order_id": order["order_id"]
+            })
+
             time.sleep(0.5)
         except Exception as e:
             log.error(f"Failed to close {symbol}: {e}")
