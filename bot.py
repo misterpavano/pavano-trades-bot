@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-bot.py — Main trading bot
+bot.py — OPTIONS-ONLY trading bot
+Buys OTM call/put options based on signals from signals.py.
+
 Usage:
   python3 bot.py --mode open     # Execute trades at market open
   python3 bot.py --mode monitor  # Check SL/TP on open positions
   python3 bot.py --mode close    # Close all positions (EOD)
+
+Contract selection:
+  - Bullish signal → OTM call, strike ~3% above current price
+  - Bearish signal → OTM put, strike ~3% below current price
+  - DTE: 7-30 days, prefer 14-21 day range
+  - Max ask: $2.00/share ($200/contract), max $100 per position
 """
 
 import argparse
@@ -14,13 +22,17 @@ import os
 import sys
 import subprocess
 import time
-from datetime import datetime, date
+import requests
+from datetime import datetime, date, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL,
-    STARTING_CAPITAL, MAX_POSITIONS, POSITION_SIZE_MIN, POSITION_SIZE_MAX,
-    STOP_LOSS_PCT, TAKE_PROFIT_PCT, TRADES_DIR, SIGNALS_FILE, MIN_SIGNAL_SCORE
+    STARTING_CAPITAL, MAX_POSITIONS, MIN_SIGNAL_SCORE,
+    STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+    MAX_POSITION_COST, CASH_RESERVE, MAX_CONTRACT_ASK,
+    OPTION_DTE_MIN, OPTION_DTE_MAX, OTM_PCT,
+    TRADES_DIR, SIGNALS_FILE
 )
 
 from alpaca.trading.client import TradingClient
@@ -39,34 +51,29 @@ TODAY = date.today().isoformat()
 LOG_FILE = os.path.join(TRADES_DIR, f"{TODAY}.json")
 
 TELEGRAM_CHAT_ID = "-5191423233"
+OPENCLAW_GATEWAY = "http://127.0.0.1:18789/api/messages/send"
+
+ALPACA_HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET,
+}
 
 
-# ─── Telegram Notification ─────────────────────────────────────────────────────
+# ─── Telegram ──────────────────────────────────────────────────────────────────
 
 def send_telegram(text: str):
-    """Send a message to the Telegram group via OpenClaw CLI."""
     try:
-        result = subprocess.run(
-            [
-                "openclaw", "message", "send",
-                "--channel", "telegram",
-                "--target", TELEGRAM_CHAT_ID,
-                "-m", text
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15
+        resp = requests.post(
+            OPENCLAW_GATEWAY,
+            json={"channel": "telegram", "to": TELEGRAM_CHAT_ID, "text": text},
+            timeout=5
         )
-        if result.returncode == 0:
-            log.info(f"Telegram sent OK")
-        else:
-            log.warning(f"Telegram send failed (rc={result.returncode}): {result.stderr[:200]}")
+        log.info(f"Telegram sent (status={resp.status_code})")
     except Exception as e:
         log.warning(f"Telegram send failed: {e}")
 
 
 def _held_duration(entry_time_iso: str) -> str:
-    """Return human-readable duration since entry."""
     try:
         entry_dt = datetime.fromisoformat(entry_time_iso)
         delta = datetime.now() - entry_dt
@@ -81,7 +88,6 @@ def _held_duration(entry_time_iso: str) -> str:
 
 
 def _signal_labels(signal: dict) -> str:
-    """Summarize which signals fired (options/news/politician)."""
     parts = []
     if signal.get("options_score", 0) > 0:
         parts.append("options")
@@ -92,10 +98,9 @@ def _signal_labels(signal: dict) -> str:
     return ", ".join(parts) if parts else "mixed"
 
 
-# ─── Trade Log Append ──────────────────────────────────────────────────────────
+# ─── Trade Log ─────────────────────────────────────────────────────────────────
 
 def append_trade_event(event: dict):
-    """Append a timestamped trade event to today's JSON events log."""
     os.makedirs(TRADES_DIR, exist_ok=True)
     event["logged_at"] = datetime.now().isoformat()
     events_file = os.path.join(TRADES_DIR, f"{TODAY}-events.json")
@@ -109,16 +114,6 @@ def append_trade_event(event: dict):
     events.append(event)
     with open(events_file, "w") as f:
         json.dump(events, f, indent=2)
-
-
-# ─── Core helpers ──────────────────────────────────────────────────────────────
-
-def get_client():
-    return TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
-
-
-def get_data_client():
-    return StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
 
 
 def load_today_log() -> dict:
@@ -140,12 +135,23 @@ def save_log(data: dict):
         json.dump(data, f, indent=2)
 
 
+# ─── Alpaca Clients ────────────────────────────────────────────────────────────
+
+def get_client():
+    return TradingClient(ALPACA_KEY, ALPACA_SECRET, paper=True)
+
+
+def get_data_client():
+    return StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+
+
 def get_account_info(client):
     account = client.get_account()
     return {
         "equity": float(account.equity),
         "cash": float(account.cash),
         "buying_power": float(account.buying_power),
+        "options_buying_power": float(getattr(account, "options_buying_power", account.buying_power)),
         "portfolio_value": float(account.portfolio_value)
     }
 
@@ -167,32 +173,198 @@ def get_positions(client) -> list:
     return result
 
 
-def get_current_price(data_client, symbol: str) -> float:
+def get_stock_price(data_client, symbol: str) -> float:
+    """Get current mid-price for an underlying stock."""
     try:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
         quote = data_client.get_stock_latest_quote(req)
         q = quote[symbol]
-        return (q.ask_price + q.bid_price) / 2
+        mid = (q.ask_price + q.bid_price) / 2
+        if mid > 0:
+            return mid
+        return float(q.ask_price or q.bid_price or 0)
     except Exception as e:
-        log.warning(f"Could not get quote for {symbol}: {e}")
+        log.warning(f"Could not get stock quote for {symbol}: {e}")
         return None
 
 
-def submit_market_order(client, symbol: str, qty: float, side: str) -> dict:
-    order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+# ─── Options Contract Selection ────────────────────────────────────────────────
+
+def get_option_ask_prices(symbols: list) -> dict:
+    """Fetch live ask prices for a list of option symbols via Alpaca data API."""
+    if not symbols:
+        return {}
+    # Batch in chunks of 100
+    result = {}
+    chunk_size = 50
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i+chunk_size]
+        try:
+            resp = requests.get(
+                "https://data.alpaca.markets/v1beta1/options/snapshots",
+                headers=ALPACA_HEADERS,
+                params={"symbols": ",".join(chunk), "feed": "indicative"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("snapshots", {})
+                for sym, snap in data.items():
+                    q = snap.get("latestQuote", {})
+                    ask = q.get("ap")
+                    if ask:
+                        result[sym] = float(ask)
+        except Exception as e:
+            log.warning(f"Option snapshot fetch failed: {e}")
+    return result
+
+
+def select_option_contract(ticker: str, direction: str, stock_price: float) -> dict | None:
+    """
+    Find the best options contract for a given ticker and direction.
+
+    direction: "LONG" → call, "SHORT" → put
+    Returns a dict with contract info or None if nothing suitable found.
+    """
+    option_type = "call" if direction == "LONG" else "put"
+    today_dt = date.today()
+    dte_min = today_dt + timedelta(days=OPTION_DTE_MIN)
+    dte_max = today_dt + timedelta(days=OPTION_DTE_MAX)
+
+    # Target strike: 3% OTM
+    if option_type == "call":
+        target_strike = stock_price * (1 + OTM_PCT)
+    else:
+        target_strike = stock_price * (1 - OTM_PCT)
+
+    params = {
+        "underlying_symbols": ticker,
+        "type": option_type,
+        "expiration_date_gte": dte_min.isoformat(),
+        "expiration_date_lte": dte_max.isoformat(),
+        "status": "active",
+        "limit": 200
+    }
+
+    try:
+        resp = requests.get(
+            f"{ALPACA_BASE_URL}/v2/options/contracts",
+            headers=ALPACA_HEADERS,
+            params=params,
+            timeout=10
+        )
+        if resp.status_code != 200:
+            log.warning(f"Options API error for {ticker}: {resp.status_code} {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        contracts = data.get("option_contracts", [])
+        if not contracts:
+            log.info(f"No options contracts found for {ticker} ({option_type}, {dte_min} to {dte_max})")
+            return None
+
+    except Exception as e:
+        log.error(f"Failed to fetch options chain for {ticker}: {e}")
+        return None
+
+    # Filter tradable contracts near target strike (within 10%)
+    tradable = [c for c in contracts if c.get("tradable")]
+    if not tradable:
+        log.info(f"No tradable contracts for {ticker}")
+        return None
+
+    # Only fetch quotes for contracts near the target strike (reduce API calls)
+    near_strike = [
+        c for c in tradable
+        if abs(float(c["strike_price"]) - target_strike) / stock_price < 0.10
+    ]
+    if not near_strike:
+        near_strike = tradable[:50]  # fallback: take first 50
+
+    symbols = [c["symbol"] for c in near_strike]
+    ask_prices = get_option_ask_prices(symbols)
+
+    candidates = []
+    for c in near_strike:
+        sym = c["symbol"]
+        # Use live ask, fallback to close_price
+        ask = ask_prices.get(sym)
+        if ask is None:
+            cp = c.get("close_price")
+            if cp:
+                ask = float(cp)
+            else:
+                continue  # no price data
+
+        if ask > MAX_CONTRACT_ASK:
+            continue  # too expensive per share
+
+        strike = float(c["strike_price"])
+        exp_date = datetime.strptime(c["expiration_date"], "%Y-%m-%d").date()
+        dte = (exp_date - today_dt).days
+
+        candidates.append({
+            "symbol": sym,
+            "strike": strike,
+            "expiration_date": c["expiration_date"],
+            "dte": dte,
+            "ask": ask,
+            "type": option_type,
+            "name": c.get("name", sym)
+        })
+
+    if not candidates:
+        log.info(f"No affordable contracts for {ticker} ({option_type}), ask ≤ ${MAX_CONTRACT_ASK}")
+        return None
+
+    # Score candidates: prefer closest to target strike + 14-21 DTE sweet spot
+    def score_contract(c):
+        strike_diff = abs(c["strike"] - target_strike) / stock_price  # normalized
+        dte_diff = abs(c["dte"] - 17) / 30  # prefer ~17 DTE
+        return strike_diff + dte_diff  # lower = better
+
+    candidates.sort(key=score_contract)
+    best = candidates[0]
+    log.info(f"Selected {best['symbol']}: strike=${best['strike']}, DTE={best['dte']}, ask=${best['ask']}")
+    return best
+
+
+# ─── Order Execution ───────────────────────────────────────────────────────────
+
+def buy_option_contract(client, contract_symbol: str, qty: int) -> dict:
+    """Submit a market buy order for an options contract."""
     req = MarketOrderRequest(
-        symbol=symbol,
+        symbol=contract_symbol,
         qty=qty,
-        side=order_side,
+        side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY
     )
     order = client.submit_order(req)
-    log.info(f"Order submitted: {side} {qty} {symbol} — ID={order.id}")
+    log.info(f"Options order submitted: BUY {qty}x {contract_symbol} — ID={order.id}")
     return {
         "order_id": str(order.id),
-        "symbol": symbol,
+        "symbol": contract_symbol,
         "qty": qty,
-        "side": side,
+        "side": "BUY",
+        "submitted_at": datetime.now().isoformat(),
+        "status": str(order.status)
+    }
+
+
+def sell_option_position(client, contract_symbol: str, qty: int) -> dict:
+    """Submit a market sell order for an options position."""
+    req = MarketOrderRequest(
+        symbol=contract_symbol,
+        qty=qty,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY
+    )
+    order = client.submit_order(req)
+    log.info(f"Options order submitted: SELL {qty}x {contract_symbol} — ID={order.id}")
+    return {
+        "order_id": str(order.id),
+        "symbol": contract_symbol,
+        "qty": qty,
+        "side": "SELL",
         "submitted_at": datetime.now().isoformat(),
         "status": str(order.status)
     }
@@ -201,14 +373,13 @@ def submit_market_order(client, symbol: str, qty: float, side: str) -> dict:
 # ─── Modes ─────────────────────────────────────────────────────────────────────
 
 def mode_open():
-    """Load signals and execute trades at market open."""
-    log.info("=== MODE: OPEN ===")
+    """Load signals and buy option contracts at market open."""
+    log.info("=== MODE: OPEN (options) ===")
     client = get_client()
     data_client = get_data_client()
 
-    # Load signals
     if not os.path.exists(SIGNALS_FILE):
-        log.error(f"No signals file found at {SIGNALS_FILE}. Run signals.py first.")
+        log.error(f"No signals file at {SIGNALS_FILE}. Run signals.py first.")
         sys.exit(1)
 
     with open(SIGNALS_FILE) as f:
@@ -217,31 +388,22 @@ def mode_open():
     tradeable = signal_data.get("tradeable", [])
     all_signals = signal_data.get("signals", tradeable)
 
-    if not tradeable:
-        log.info("No tradeable signals today. No trades placed.")
-        daily_log = load_today_log()
-        daily_log["notes"] = "No tradeable signals"
-        save_log(daily_log)
+    account = get_account_info(client)
+    log.info(f"Account: equity=${account['equity']:.2f} cash=${account['cash']:.2f} options_bp=${account['options_buying_power']:.2f}")
 
-        # Notify: no trades
-        account = get_account_info(client)
+    if not tradeable:
         top = sorted(all_signals, key=lambda s: s.get("score", 0), reverse=True)[:5]
         watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in top) if top else "none"
         msg = (
             f"📊 No trades today — no signals above threshold.\n"
             f"Watching: {watching}\n"
-            f"💵 Cash: ${account['cash']:.2f}"
+            f"💵 Options BP: ${account['options_buying_power']:.2f}"
         )
         send_telegram(msg)
-        append_trade_event({"type": "no_trades", "watching": watching, "cash": account["cash"]})
+        daily_log = load_today_log()
+        daily_log["notes"] = "No tradeable signals"
+        save_log(daily_log)
         return
-
-    account = get_account_info(client)
-    log.info(f"Account: equity=${account['equity']:.2f} cash=${account['cash']:.2f}")
-
-    # Hard cap: never exceed $500 total exposure
-    max_exposure = min(STARTING_CAPITAL, account["equity"])
-    available_cash = min(account["cash"], max_exposure)
 
     existing_positions = get_positions(client)
     open_count = len(existing_positions)
@@ -251,67 +413,100 @@ def mode_open():
         return
 
     slots_available = MAX_POSITIONS - open_count
-    signals_to_trade = [s for s in tradeable if s["score"] >= MIN_SIGNAL_SCORE][:slots_available]
+    signals_to_trade = [s for s in tradeable if s.get("score", 0) >= MIN_SIGNAL_SCORE][:slots_available]
+
+    # Check cash reserve
+    available_cash = account["cash"]
+    if available_cash <= CASH_RESERVE:
+        msg = f"⚠️ Insufficient cash (${available_cash:.2f}) to trade — need >${CASH_RESERVE} reserve."
+        log.warning(msg)
+        send_telegram(msg)
+        return
+
+    spendable = available_cash - CASH_RESERVE
+    log.info(f"Spendable (after ${CASH_RESERVE} reserve): ${spendable:.2f}")
 
     daily_log = load_today_log()
     daily_log["signals_used"] = signals_to_trade
 
     for signal in signals_to_trade:
-        symbol = signal["ticker"]
-        direction = signal["direction"]
+        ticker = signal["ticker"]
+        direction = signal.get("direction", "LONG")
+        score_val = signal.get("score", 0)
+        signals_fired = _signal_labels(signal)
+        option_type_label = "CALL" if direction == "LONG" else "PUT"
 
-        if direction != "LONG":
-            log.info(f"Skipping {symbol} — SHORT signals not supported (paper account, no shorting for now)")
-            continue
-
-        # Check if already holding this symbol
-        already_held = any(p["symbol"] == symbol for p in existing_positions)
+        # Check if already have a position on this underlying
+        already_held = any(ticker in p["symbol"] for p in existing_positions)
         if already_held:
-            log.info(f"Already holding {symbol}, skipping")
+            log.info(f"Already have a {ticker} options position, skipping")
             continue
 
-        # Calculate position size (10-25% of available cash)
-        position_pct = POSITION_SIZE_MIN + (POSITION_SIZE_MAX - POSITION_SIZE_MIN) * (signal["score"] - 5) / 5
-        position_pct = min(POSITION_SIZE_MAX, max(POSITION_SIZE_MIN, position_pct))
-        position_dollars = available_cash * position_pct
+        if spendable < 10:
+            log.info("No more spendable cash")
+            break
 
-        # Don't exceed remaining headroom under $500 cap
-        current_exposure = sum(p["market_value"] for p in existing_positions)
-        max_this_trade = min(position_dollars, STARTING_CAPITAL - current_exposure)
-
-        if max_this_trade < 10:
-            log.info(f"Insufficient headroom for {symbol} (${max_this_trade:.2f})")
+        # Get stock price
+        stock_price = get_stock_price(data_client, ticker)
+        if not stock_price:
+            stock_price = signal.get("current_price")
+        if not stock_price or stock_price <= 0:
+            log.warning(f"No price for {ticker}, skipping")
             continue
 
-        # Get current price
-        price = get_current_price(data_client, symbol)
-        if not price or price <= 0:
-            price = signal.get("current_price")
-        if not price or price <= 0:
-            log.warning(f"No price for {symbol}, skipping")
+        # Select best contract
+        contract = select_option_contract(ticker, direction, stock_price)
+        if not contract:
+            log.info(f"No suitable option contract for {ticker}, skipping")
             continue
 
-        qty = int(max_this_trade / price)
+        # Position sizing: max $100 per position, but limited by spendable
+        # Each contract = ask_per_share * 100
+        cost_per_contract = contract["ask"] * 100
+        if cost_per_contract < 1:
+            log.info(f"Contract cost suspiciously low (${cost_per_contract:.2f}), skipping")
+            continue
+
+        max_spend = min(MAX_POSITION_COST, spendable)
+        qty = max(1, int(max_spend / cost_per_contract))
+        # Never spend more than MAX_POSITION_COST
+        while qty > 0 and qty * cost_per_contract > MAX_POSITION_COST:
+            qty -= 1
+
         if qty < 1:
-            log.info(f"Position too small for {symbol} (${max_this_trade:.2f} @ ${price:.2f})")
+            log.info(f"Cannot afford even 1 contract of {contract['symbol']} (${cost_per_contract:.2f}/contract)")
             continue
 
-        actual_cost = qty * price
-        stop_price = round(price * (1 + STOP_LOSS_PCT), 2)
-        target_price = round(price * (1 + TAKE_PROFIT_PCT), 2)
-        log.info(f"Buying {qty} {symbol} @ ~${price:.2f} = ${actual_cost:.2f} ({position_pct*100:.0f}% of cash)")
+        total_cost = qty * cost_per_contract
+        exp_date = contract["expiration_date"]
+        dte = contract["dte"]
+        strike = contract["strike"]
+        ask_per_share = contract["ask"]
+
+        log.info(f"Buying {qty}x {contract['symbol']} @ ${ask_per_share:.2f}/share = ${total_cost:.2f}")
 
         try:
-            order = submit_market_order(client, symbol, qty, "BUY")
+            order = buy_option_contract(client, contract["symbol"], qty)
+
+            stop_premium = round(ask_per_share * (1 + STOP_LOSS_PCT), 2)
+            target_premium = round(ask_per_share * (1 + TAKE_PROFIT_PCT), 2)
+
             trade_record = {
                 **order,
-                "signal_score": signal["score"],
+                "underlying_ticker": ticker,
+                "option_type": option_type_label,
+                "contract_symbol": contract["symbol"],
+                "strike": strike,
+                "expiration_date": exp_date,
+                "dte_at_entry": dte,
+                "ask_at_entry": ask_per_share,
+                "qty_contracts": qty,
+                "total_cost": total_cost,
+                "stop_premium": stop_premium,
+                "target_premium": target_premium,
+                "signal_score": score_val,
                 "signal_direction": direction,
-                "entry_price": price,
-                "planned_qty": qty,
-                "planned_cost": actual_cost,
-                "stop_loss_price": stop_price,
-                "take_profit_price": target_price,
+                "signals_fired": signals_fired,
                 "top_headline": signal.get("top_headline", ""),
                 "closed": False,
                 "exit_price": None,
@@ -319,55 +514,57 @@ def mode_open():
                 "pnl_pct": None
             }
             daily_log["trades"].append(trade_record)
-            available_cash -= actual_cost
-            existing_positions.append({"symbol": symbol, "market_value": actual_cost})
+            spendable -= total_cost
+            existing_positions.append({"symbol": contract["symbol"], "market_value": total_cost})
 
-            # Refresh account cash after buy
             try:
                 acct_refresh = get_account_info(client)
                 cash_remaining = acct_refresh["cash"]
             except Exception:
-                cash_remaining = available_cash
+                cash_remaining = available_cash - total_cost
 
-            # Telegram notification: BUY
-            score_val = signal.get("score", 0)
-            signals_fired = _signal_labels(signal)
             msg = (
-                f"🟢 BUY EXECUTED — {symbol}\n"
-                f"📥 {qty} shares @ ${price:.2f}\n"
-                f"💰 Cost: ${actual_cost:.2f}\n"
-                f"🎯 Signal score: {score_val}/10 ({signals_fired})\n"
-                f"🛑 Stop: ${stop_price:.2f} | 🎯 Target: ${target_price:.2f}\n"
+                f"🟢 OPTIONS BUY — {ticker} {option_type_label}\n"
+                f"📋 Contract: {contract['symbol']}\n"
+                f"💵 {qty} contract{'s' if qty > 1 else ''} @ ${ask_per_share:.2f}/share (${total_cost:.2f} total)\n"
+                f"🎯 Strike: ${strike:.0f} | Exp: {exp_date} ({dte} DTE)\n"
+                f"📊 Signal: {score_val}/10 — {signals_fired}\n"
+                f"🛑 Stop: -50% (${stop_premium:.2f}/sh) | 🎯 Target: +100% (${target_premium:.2f}/sh)\n"
                 f"💵 Cash remaining: ${cash_remaining:.2f}"
             )
             send_telegram(msg)
             append_trade_event({
-                "type": "buy",
-                "symbol": symbol,
-                "qty": qty,
-                "price": price,
-                "cost": actual_cost,
+                "type": "options_buy",
+                "underlying": ticker,
+                "option_type": option_type_label,
+                "contract_symbol": contract["symbol"],
+                "strike": strike,
+                "expiration_date": exp_date,
+                "dte": dte,
+                "ask_per_share": ask_per_share,
+                "qty_contracts": qty,
+                "total_cost": total_cost,
+                "stop_premium": stop_premium,
+                "target_premium": target_premium,
                 "score": score_val,
                 "signals_fired": signals_fired,
-                "stop_loss": stop_price,
-                "take_profit": target_price,
                 "cash_remaining": cash_remaining,
                 "order_id": order["order_id"]
             })
 
             time.sleep(0.5)
+
         except Exception as e:
-            log.error(f"Order failed for {symbol}: {e}")
+            log.error(f"Options order failed for {ticker} ({contract['symbol']}): {e}")
 
     save_log(daily_log)
-    log.info(f"Open mode complete. {len(daily_log['trades'])} trades placed.")
+    log.info(f"Open mode complete. {len(daily_log['trades'])} option trades placed.")
 
 
 def mode_monitor():
-    """Check stop loss and take profit on open positions."""
-    log.info("=== MODE: MONITOR ===")
+    """Check stop loss and take profit on open options positions."""
+    log.info("=== MODE: MONITOR (options) ===")
     client = get_client()
-    data_client = get_data_client()
 
     daily_log = load_today_log()
     positions = get_positions(client)
@@ -379,10 +576,23 @@ def mode_monitor():
     for pos in positions:
         symbol = pos["symbol"]
         plpc = pos["unrealized_plpc"]
-        current_price = pos["current_price"]
+        current_price = pos["current_price"]  # per-share option price
         unrealized_pl = pos["unrealized_pl"]
+        qty = abs(pos["qty"])
 
-        log.info(f"{symbol}: current=${current_price:.2f} P&L%={plpc*100:.2f}%")
+        log.info(f"{symbol}: current=${current_price:.2f}/sh P&L%={plpc*100:.2f}%")
+
+        # Find entry info from log
+        entry_trade = None
+        for trade in daily_log["trades"]:
+            if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+                entry_trade = trade
+                break
+
+        # Determine option type label
+        option_type_label = "CALL" if "C" in symbol else "PUT"
+        # Extract underlying from symbol or trade log
+        underlying = entry_trade["underlying_ticker"] if entry_trade else symbol[:4]
 
         should_close = False
         reason = ""
@@ -390,33 +600,31 @@ def mode_monitor():
 
         if plpc <= STOP_LOSS_PCT:
             should_close = True
-            reason = f"stop loss hit ({plpc*100:.2f}%)"
+            reason = f"stop loss hit ({plpc*100:.1f}%)"
             close_type = "stop_loss"
         elif plpc >= TAKE_PROFIT_PCT:
             should_close = True
-            reason = f"take profit hit ({plpc*100:.2f}%)"
+            reason = f"take profit hit ({plpc*100:.1f}%)"
             close_type = "take_profit"
 
         if should_close:
             log.info(f"Closing {symbol}: {reason}")
             try:
-                qty = abs(pos["qty"])
-                order = submit_market_order(client, symbol, qty, "SELL")
+                order = sell_option_position(client, symbol, int(qty))
 
-                # Find entry time from trade log
                 entry_time = None
-                for trade in daily_log["trades"]:
-                    if trade["symbol"] == symbol and not trade["closed"]:
-                        entry_time = trade.get("submitted_at")
-                        trade["closed"] = True
-                        trade["exit_price"] = current_price
-                        trade["close_reason"] = reason
-                        trade["pnl"] = unrealized_pl
-                        trade["pnl_pct"] = plpc * 100
-                        trade["closed_at"] = datetime.now().isoformat()
-                        break
+                if entry_trade:
+                    entry_time = entry_trade.get("submitted_at")
+                    entry_trade["closed"] = True
+                    entry_trade["exit_price"] = current_price
+                    entry_trade["close_reason"] = reason
+                    entry_trade["pnl"] = unrealized_pl
+                    entry_trade["pnl_pct"] = plpc * 100
+                    entry_trade["closed_at"] = datetime.now().isoformat()
 
                 held = _held_duration(entry_time) if entry_time else "?"
+                pnl_sign = "+" if unrealized_pl >= 0 else "-"
+                pnl_pct_sign = "+" if plpc >= 0 else "-"
                 pnl_abs = abs(unrealized_pl)
                 pnl_pct_abs = abs(plpc * 100)
 
@@ -425,30 +633,29 @@ def mode_monitor():
                     cash = acct["cash"]
                     portfolio = acct["portfolio_value"]
                 except Exception:
-                    cash = 0
-                    portfolio = 0
+                    cash = portfolio = 0
 
                 if close_type == "take_profit":
-                    msg = (
-                        f"✅ SOLD — {symbol} [TARGET HIT]\n"
-                        f"📤 {int(qty)} shares @ ${current_price:.2f}\n"
-                        f"📊 P&L: +${pnl_abs:.2f} (+{pnl_pct_abs:.1f}%)\n"
-                        f"⏱ Held: {held}\n"
-                        f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
-                    )
+                    emoji = "✅"
+                    reason_label = "TARGET HIT"
                 else:
-                    msg = (
-                        f"🔴 STOPPED OUT — {symbol}\n"
-                        f"📤 {int(qty)} shares @ ${current_price:.2f}\n"
-                        f"📊 P&L: -${pnl_abs:.2f} (-{pnl_pct_abs:.1f}%)\n"
-                        f"⏱ Held: {held}\n"
-                        f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
-                    )
+                    emoji = "🔴"
+                    reason_label = "STOP HIT"
 
+                msg = (
+                    f"{emoji} OPTIONS SOLD — {underlying} {option_type_label} [{reason_label}]\n"
+                    f"📋 {symbol}\n"
+                    f"💵 Sold @ ${current_price:.2f}/share\n"
+                    f"📊 P&L: {pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)\n"
+                    f"⏱ Held: {held}\n"
+                    f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
+                )
                 send_telegram(msg)
                 append_trade_event({
                     "type": close_type,
                     "symbol": symbol,
+                    "underlying": underlying,
+                    "option_type": option_type_label,
                     "qty": int(qty),
                     "price": current_price,
                     "pnl": unrealized_pl,
@@ -466,8 +673,8 @@ def mode_monitor():
 
 
 def mode_close():
-    """Close ALL open positions (EOD)."""
-    log.info("=== MODE: CLOSE ===")
+    """Close ALL open options positions (EOD)."""
+    log.info("=== MODE: CLOSE (options EOD) ===")
     client = get_client()
 
     positions = get_positions(client)
@@ -484,12 +691,19 @@ def mode_close():
         plpc = pos["unrealized_plpc"]
         unrealized_pl = pos["unrealized_pl"]
 
-        log.info(f"Closing {symbol}: {qty} shares @ ${current_price:.2f} ({plpc*100:.2f}%)")
+        # Determine option type from symbol
+        option_type_label = "CALL" if "C" in symbol else "PUT"
+        underlying = symbol[:4] if len(symbol) > 4 else symbol
+
+        log.info(f"EOD closing {symbol}: {qty}x @ ${current_price:.2f} ({plpc*100:.1f}%)")
+
         try:
-            order = submit_market_order(client, symbol, qty, "SELL")
+            order = sell_option_position(client, symbol, int(qty))
 
             for trade in daily_log["trades"]:
-                if trade["symbol"] == symbol and not trade["closed"]:
+                if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+                    underlying = trade.get("underlying_ticker", underlying)
+                    option_type_label = trade.get("option_type", option_type_label)
                     trade["closed"] = True
                     trade["exit_price"] = current_price
                     trade["close_reason"] = "EOD close"
@@ -503,17 +717,17 @@ def mode_close():
                 cash = acct["cash"]
                 portfolio = acct["portfolio_value"]
             except Exception:
-                cash = 0
-                portfolio = 0
+                cash = portfolio = 0
 
             pnl_sign = "+" if unrealized_pl >= 0 else "-"
-            pnl_abs = abs(unrealized_pl)
             pnl_pct_sign = "+" if plpc >= 0 else "-"
+            pnl_abs = abs(unrealized_pl)
             pnl_pct_abs = abs(plpc * 100)
 
             msg = (
-                f"🔔 EOD CLOSE — {symbol}\n"
-                f"📤 {int(qty)} shares @ ${current_price:.2f}\n"
+                f"🔔 EOD CLOSE — {underlying} {option_type_label}\n"
+                f"📋 {symbol}\n"
+                f"💵 Sold @ ${current_price:.2f}/share\n"
                 f"📊 P&L: {pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)\n"
                 f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
             )
@@ -521,6 +735,8 @@ def mode_close():
             append_trade_event({
                 "type": "eod_close",
                 "symbol": symbol,
+                "underlying": underlying,
+                "option_type": option_type_label,
                 "qty": int(qty),
                 "price": current_price,
                 "pnl": unrealized_pl,
@@ -531,27 +747,28 @@ def mode_close():
             })
 
             time.sleep(0.5)
+
         except Exception as e:
             log.error(f"Failed to close {symbol}: {e}")
 
     save_log(daily_log)
-    log.info("All positions closed.")
+    log.info("All options positions closed.")
 
-    # Run learning system to record outcomes
-    log.info("Running learn.py to record today's learnings...")
+    # Run learning system
+    log.info("Running learn.py...")
     try:
         learn_script = os.path.join(os.path.dirname(__file__), "learn.py")
         result = subprocess.run([sys.executable, learn_script], capture_output=True, text=True, timeout=60)
         if result.returncode == 0:
-            log.info("learn.py completed successfully")
+            log.info("learn.py completed")
         else:
-            log.warning(f"learn.py returned non-zero: {result.stderr[:200]}")
+            log.warning(f"learn.py error: {result.stderr[:200]}")
     except Exception as e:
         log.error(f"Failed to run learn.py: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Alpaca Paper Trading Bot")
+    parser = argparse.ArgumentParser(description="Alpaca Options Trading Bot")
     parser.add_argument("--mode", choices=["open", "monitor", "close"], required=True)
     args = parser.parse_args()
 
