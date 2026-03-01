@@ -5,3 +5,9 @@ __pycache__/
 signals_output.json
 trades/*.json
 knowledge/politicians/history.json
+
+# Education repos (cloned for reference, not tracked)
+knowledge/education/quant-trading/
+knowledge/education/volatility-trading/
+knowledge/education/Options-Trading-Strategies-in-Python/
+knowledge/education/optopsy/

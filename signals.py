@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 signals.py — Options flow + news + politician signal scanner
+
+Reference: knowledge/education/REFERENCE.md — consult before adjusting thresholds
 Final score = options_score (0-6) + news_score (0-2) + politician_score (0-3) — max 10
 
 Options scoring improvements (from community research):

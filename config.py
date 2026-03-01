@@ -17,9 +17,9 @@ MIN_SIGNAL_SCORE = 5        # Only trade if score >= 5
 # Options-specific config
 STOP_LOSS_PCT = -0.50       # -50% on option premium
 TAKE_PROFIT_PCT = 1.00      # +100% on option premium (double up)
-MAX_POSITION_COST = 100     # max $100 per options position (1-2 contracts typically)
+MAX_POSITION_COST = 150     # max $100 per options position (1-2 contracts typically)
 CASH_RESERVE = 200          # always keep $200 in reserve
-MAX_CONTRACT_ASK = 2.00     # skip if ask > $2.00/share ($200/contract)
+MAX_CONTRACT_ASK = 3.00     # skip if ask > $2.00/share ($200/contract)
 OPTION_DTE_MIN = 7          # min days to expiry
 OPTION_DTE_MAX = 30         # max days to expiry
 OTM_PCT = 0.03              # target 3% OTM strikes
