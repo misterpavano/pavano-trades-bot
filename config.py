@@ -15,8 +15,8 @@ MAX_POSITIONS = 5
 MIN_POSITIONS = 3
 POSITION_SIZE_MIN = 0.10   # 10% of cash
 POSITION_SIZE_MAX = 0.25   # 25% of cash
-STOP_LOSS_PCT = -0.08       # -8%
-TAKE_PROFIT_PCT = 0.15      # +15%
+STOP_LOSS_PCT = -0.20       # -20%
+TAKE_PROFIT_PCT = 0.20      # +20%
 MIN_SIGNAL_SCORE = 5        # Only trade if score >= 5
 
 TRADES_DIR = "/home/pavano/.openclaw/workspace/trading/trades"
