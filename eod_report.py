@@ -13,7 +13,7 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     ALPACA_KEY, ALPACA_SECRET, TRADES_DIR,
-    STARTING_CAPITAL, TELEGRAM_GROUP, OPENCLAW_GATEWAY
+    STARTING_CAPITAL, TELEGRAM_GROUP
 )
 
 from alpaca.trading.client import TradingClient
@@ -168,14 +168,13 @@ def build_report(account: dict, daily_log: dict) -> str:
     return report
 
 
+TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
 def send_telegram(message: str):
-    payload = {
-        "channel": "telegram",
-        "to": TELEGRAM_GROUP,
-        "text": message
-    }
+    payload = {"chat_id": TELEGRAM_GROUP, "text": message, "parse_mode": "Markdown"}
     try:
-        resp = requests.post(OPENCLAW_GATEWAY, json=payload, timeout=10)
+        resp = requests.post(TELEGRAM_API, json=payload, timeout=10)
         if resp.ok:
             log.info("EOD report sent to Telegram ✅")
         else:

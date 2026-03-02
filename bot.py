@@ -32,7 +32,7 @@ from config import (
     STOP_LOSS_PCT, TAKE_PROFIT_PCT,
     MAX_POSITION_COST, CASH_RESERVE, MAX_CONTRACT_ASK,
     OPTION_DTE_MIN, OPTION_DTE_MAX, OTM_PCT,
-    TRADES_DIR, SIGNALS_FILE
+    TRADES_DIR, SIGNALS_FILE, SIGNALS_EOD_FILE
 )
 
 from alpaca.trading.client import TradingClient
@@ -51,7 +51,8 @@ TODAY = date.today().isoformat()
 LOG_FILE = os.path.join(TRADES_DIR, f"{TODAY}.json")
 
 TELEGRAM_CHAT_ID = "-5191423233"
-OPENCLAW_GATEWAY = "http://127.0.0.1:18789/api/messages/send"
+TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 ALPACA_HEADERS = {
     "APCA-API-KEY-ID": ALPACA_KEY,
@@ -64,8 +65,8 @@ ALPACA_HEADERS = {
 def send_telegram(text: str):
     try:
         resp = requests.post(
-            OPENCLAW_GATEWAY,
-            json={"channel": "telegram", "to": TELEGRAM_CHAT_ID, "text": text},
+            TELEGRAM_API,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
             timeout=5
         )
         log.info(f"Telegram sent (status={resp.status_code})")
@@ -372,36 +373,132 @@ def sell_option_position(client, contract_symbol: str, qty: int) -> dict:
 
 # ─── Modes ─────────────────────────────────────────────────────────────────────
 
+
+# ─── Two-Shot Signal Loading ───────────────────────────────────────────────────
+
+def check_open_confirmation(ticker: str, signal_direction: str) -> tuple:
+    """
+    Check if current price confirms the EOD signal direction.
+    Returns (confirmed: bool, reason: str)
+    Gap > 2% against signal direction = skip.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.fast_info
+        current = info.last_price
+        prev_close = info.previous_close
+        if not current or not prev_close or prev_close == 0:
+            return True, "no gap data, proceeding"
+        gap_pct = (current - prev_close) / prev_close
+        if signal_direction == "LONG":
+            if gap_pct < -0.02:
+                return False, f"gapped down {gap_pct*100:.1f}% against LONG signal"
+            return True, f"gap {gap_pct*100:+.1f}% confirms LONG"
+        else:  # SHORT
+            if gap_pct > 0.02:
+                return False, f"gapped up {gap_pct*100:.1f}% against SHORT signal"
+            return True, f"gap {gap_pct*100:+.1f}% confirms SHORT"
+    except Exception as e:
+        log.warning(f"Gap check failed for {ticker}: {e}")
+        return True, "gap check error, proceeding"
+
+
+def load_signals():
+    """
+    Two-shot loader: prefer today's or yesterday's EOD signals, merge with open scan.
+    Returns (eod_data, open_data) — either can be None.
+    """
+    today_str = date.today().isoformat()
+    yesterday_str = (date.today() - timedelta(days=1)).isoformat()
+    eod_data = None
+    open_data = None
+
+    if os.path.exists(SIGNALS_EOD_FILE):
+        try:
+            with open(SIGNALS_EOD_FILE) as f:
+                data = json.load(f)
+            scan_date = data.get("scanned_at", "")[:10]
+            if scan_date in [today_str, yesterday_str]:
+                eod_data = data
+                log.info(f"Loaded EOD signals from {scan_date} ({len(data.get('tradeable', []))} tradeable)")
+        except Exception as e:
+            log.warning(f"Could not load EOD signals: {e}")
+
+    if os.path.exists(SIGNALS_FILE):
+        try:
+            with open(SIGNALS_FILE) as f:
+                data = json.load(f)
+            scan_date = data.get("scanned_at", "")[:10]
+            if scan_date == today_str:
+                open_data = data
+                log.info(f"Loaded open scan signals from today ({len(data.get('tradeable', []))} tradeable)")
+        except Exception as e:
+            log.warning(f"Could not load open signals: {e}")
+
+    return eod_data, open_data
+
+
 def mode_open():
     """Load signals and buy option contracts at market open."""
     log.info("=== MODE: OPEN (options) ===")
     client = get_client()
     data_client = get_data_client()
 
-    if not os.path.exists(SIGNALS_FILE):
-        log.error(f"No signals file at {SIGNALS_FILE}. Run signals.py first.")
-        sys.exit(1)
-
-    with open(SIGNALS_FILE) as f:
-        signal_data = json.load(f)
-
-    tradeable = signal_data.get("tradeable", [])
-    all_signals = signal_data.get("signals", tradeable)
+    eod_signals, open_signals = load_signals()
 
     account = get_account_info(client)
     log.info(f"Account: equity=${account['equity']:.2f} cash=${account['cash']:.2f} options_bp=${account['options_buying_power']:.2f}")
 
+    # Build tradeable list: EOD-confirmed first, then open scan additions
+    tradeable = []
+    covered_tickers = set()
+
+    if eod_signals:
+        for s in eod_signals.get("tradeable", []):
+            ticker = s["ticker"]
+            direction = s.get("direction", "LONG")
+            confirmed, reason = check_open_confirmation(ticker, direction)
+            if confirmed:
+                s["signal_source"] = "EOD flow"
+                s["confirmation_note"] = reason
+                tradeable.append(s)
+                covered_tickers.add(ticker)
+                log.info(f"EOD signal confirmed: {ticker} — {reason}")
+            else:
+                log.info(f"EOD signal skipped (gap check): {ticker} — {reason}")
+
+    if open_signals:
+        for s in open_signals.get("tradeable", []):
+            if s["ticker"] not in covered_tickers:
+                s["signal_source"] = "open scan"
+                s["confirmation_note"] = ""
+                tradeable.append(s)
+                log.info(f"Open scan signal added: {s['ticker']}")
+
     if not tradeable:
-        top = sorted(all_signals, key=lambda s: s.get("score", 0), reverse=True)[:5]
+        all_sigs = []
+        if eod_signals: all_sigs += eod_signals.get("signals", [])
+        if open_signals: all_sigs += open_signals.get("signals", [])
+        if not all_sigs and not os.path.exists(SIGNALS_FILE) and not os.path.exists(SIGNALS_EOD_FILE):
+            log.error("No signals files found. Run signals.py first.")
+            sys.exit(1)
+        seen = set()
+        top = []
+        for s in sorted(all_sigs, key=lambda x: x.get("score", 0), reverse=True):
+            if s["ticker"] not in seen:
+                top.append(s)
+                seen.add(s["ticker"])
+            if len(top) >= 5:
+                break
         watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in top) if top else "none"
         msg = (
-            f"📊 No trades today — no signals above threshold.\n"
+            f"📊 No trades today — no confirmed signals.\n"
             f"Watching: {watching}\n"
             f"💵 Options BP: ${account['options_buying_power']:.2f}"
         )
         send_telegram(msg)
         daily_log = load_today_log()
-        daily_log["notes"] = "No tradeable signals"
+        daily_log["notes"] = "No confirmed signals"
         save_log(daily_log)
         return
 
@@ -506,6 +603,7 @@ def mode_open():
                 "target_premium": target_premium,
                 "signal_score": score_val,
                 "signal_direction": direction,
+                "signal_source": signal.get("signal_source", "scan"),
                 "signals_fired": signals_fired,
                 "top_headline": signal.get("top_headline", ""),
                 "closed": False,
@@ -523,12 +621,16 @@ def mode_open():
             except Exception:
                 cash_remaining = available_cash - total_cost
 
+            source_label = signal.get("signal_source", "scan")
+            confirm_note = signal.get("confirmation_note", "")
+            source_line = f"📡 {source_label}" + (f" — {confirm_note}" if confirm_note else "")
             msg = (
                 f"🟢 OPTIONS BUY — {ticker} {option_type_label}\n"
                 f"📋 Contract: {contract['symbol']}\n"
                 f"💵 {qty} contract{'s' if qty > 1 else ''} @ ${ask_per_share:.2f}/share (${total_cost:.2f} total)\n"
                 f"🎯 Strike: ${strike:.0f} | Exp: {exp_date} ({dte} DTE)\n"
                 f"📊 Signal: {score_val}/10 — {signals_fired}\n"
+                f"{source_line}\n"
                 f"🛑 Stop: -50% (${stop_premium:.2f}/sh) | 🎯 Target: +100% (${target_premium:.2f}/sh)\n"
                 f"💵 Cash remaining: ${cash_remaining:.2f}"
             )

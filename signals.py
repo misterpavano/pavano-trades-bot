@@ -48,7 +48,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(__file__))
 from config import (
-    WATCHLIST, SEARXNG_URL, SIGNALS_FILE,
+    WATCHLIST, SEARXNG_URL, SIGNALS_FILE, SIGNALS_EOD_FILE,
     UNUSUAL_VOLUME_MULTIPLIER, MIN_EXPIRY_DAYS, MAX_EXPIRY_DAYS,
     MIN_SIGNAL_SCORE
 )
@@ -462,11 +462,21 @@ def scan_all() -> list:
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Signal scanner")
+    parser.add_argument("--source", choices=["eod", "open"], default="open",
+                        help="eod = end-of-day scan (saves to signals_eod.json), open = intraday scan")
+    args = parser.parse_args()
+
     signals = scan_all()
+
+    # Tag each signal with source
+    for s in signals:
+        s["source"] = args.source
 
     tradeable = [s for s in signals if s["tradeable"]]
     log.info(f"\n{'='*50}")
-    log.info(f"Scan complete. {len(tradeable)}/{len(signals)} tickers tradeable (score >= {MIN_SIGNAL_SCORE})")
+    log.info(f"Scan complete [{args.source}]. {len(tradeable)}/{len(signals)} tickers tradeable (score >= {MIN_SIGNAL_SCORE})")
     for s in tradeable:
         pol = f" 🏛️ {s['politician_note']}" if s.get("politician_note") else ""
         sweep = f" 🌊 {s['sweep_calls']}C/{s['sweep_puts']}P sweeps" if (s.get('sweep_calls') or s.get('sweep_puts')) else ""
@@ -477,12 +487,15 @@ def main():
 
     output = {
         "scanned_at": datetime.now().isoformat(),
+        "source": args.source,
         "signals": signals,
         "tradeable": tradeable
     }
-    with open(SIGNALS_FILE, "w") as f:
+
+    out_file = SIGNALS_EOD_FILE if args.source == "eod" else SIGNALS_FILE
+    with open(out_file, "w") as f:
         json.dump(output, f, indent=2)
-    log.info(f"Signals saved to {SIGNALS_FILE}")
+    log.info(f"Signals saved to {out_file} (source={args.source})")
 
 
 if __name__ == "__main__":
