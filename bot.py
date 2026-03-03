@@ -23,9 +23,12 @@ import sys
 import subprocess
 import time
 import requests
+import yfinance as yf
 from datetime import datetime, date, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
+DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
+
 from config import (
     ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL,
     STARTING_CAPITAL, MAX_POSITIONS, MIN_SIGNAL_SCORE,
@@ -391,12 +394,12 @@ def check_open_confirmation(ticker: str, signal_direction: str) -> tuple:
             return True, "no gap data, proceeding"
         gap_pct = (current - prev_close) / prev_close
         if signal_direction == "LONG":
-            if gap_pct < -0.02:
-                return False, f"gapped down {gap_pct*100:.1f}% against LONG signal"
+            if gap_pct < -0.03:
+                return False, f"gapped down {gap_pct*100:.1f}% against LONG signal (>3%)"
             return True, f"gap {gap_pct*100:+.1f}% confirms LONG"
         else:  # SHORT
-            if gap_pct > 0.02:
-                return False, f"gapped up {gap_pct*100:.1f}% against SHORT signal"
+            if gap_pct > 0.03:
+                return False, f"gapped up {gap_pct*100:.1f}% against SHORT signal (>3%)"
             return True, f"gap {gap_pct*100:+.1f}% confirms SHORT"
     except Exception as e:
         log.warning(f"Gap check failed for {ticker}: {e}")
@@ -476,31 +479,39 @@ def mode_open():
                 log.info(f"Open scan signal added: {s['ticker']}")
 
     if not tradeable:
+        # Gap check rejected everything — fall back to top scoring signals ignoring gap filter
         all_sigs = []
-        if eod_signals: all_sigs += eod_signals.get("signals", [])
-        if open_signals: all_sigs += open_signals.get("signals", [])
-        if not all_sigs and not os.path.exists(SIGNALS_FILE) and not os.path.exists(SIGNALS_EOD_FILE):
-            log.error("No signals files found. Run signals.py first.")
+        if eod_signals: all_sigs += eod_signals.get("tradeable", [])
+        if open_signals: all_sigs += open_signals.get("tradeable", [])
+        if not all_sigs:
+            if eod_signals: all_sigs += eod_signals.get("signals", [])
+            if open_signals: all_sigs += open_signals.get("signals", [])
+        if not all_sigs:
+            log.error("No signals found at all. Run signals.py first.")
             sys.exit(1)
+        # Use top signals by score, gap check bypassed
         seen = set()
-        top = []
         for s in sorted(all_sigs, key=lambda x: x.get("score", 0), reverse=True):
-            if s["ticker"] not in seen:
-                top.append(s)
+            if s["ticker"] not in seen and s.get("score", 0) >= MIN_SIGNAL_SCORE:
+                s["signal_source"] = "EOD flow (gap bypass)"
+                s["confirmation_note"] = "gap check bypassed — all signals gap-rejected"
+                tradeable.append(s)
                 seen.add(s["ticker"])
-            if len(top) >= 5:
+            if len(tradeable) >= 3:
                 break
-        watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in top) if top else "none"
-        msg = (
-            f"📊 No trades today — no confirmed signals.\n"
-            f"Watching: {watching}\n"
-            f"💵 Options BP: ${account['options_buying_power']:.2f}"
-        )
-        send_telegram(msg)
-        daily_log = load_today_log()
-        daily_log["notes"] = "No confirmed signals"
-        save_log(daily_log)
-        return
+        if not tradeable:
+            watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in all_sigs[:5]) if all_sigs else "none"
+            msg = (
+                f"📊 No trades today — signals below minimum score.\n"
+                f"Watching: {watching}\n"
+                f"💵 Options BP: ${account['options_buying_power']:.2f}"
+            )
+            send_telegram(msg)
+            daily_log = load_today_log()
+            daily_log["notes"] = "No signals met minimum score"
+            save_log(daily_log)
+            return
+        log.info(f"Gap bypass: using {len(tradeable)} signals after gap check rejected all")
 
     existing_positions = get_positions(client)
     open_count = len(existing_positions)
@@ -554,7 +565,7 @@ def mode_open():
         # Select best contract
         contract = select_option_contract(ticker, direction, stock_price)
         if not contract:
-            log.info(f"No suitable option contract for {ticker}, skipping")
+            log.warning(f"SKIPPED {ticker}: no suitable option contract found (direction={direction}, price=${stock_price:.2f}, DTE={OPTION_DTE_MIN}-{OPTION_DTE_MAX}, maxAsk=${MAX_CONTRACT_ASK})")
             continue
 
         # Position sizing: max $100 per position, but limited by spendable
@@ -583,7 +594,11 @@ def mode_open():
         log.info(f"Buying {qty}x {contract['symbol']} @ ${ask_per_share:.2f}/share = ${total_cost:.2f}")
 
         try:
-            order = buy_option_contract(client, contract["symbol"], qty)
+            if DRY_RUN:
+                log.info(f"DRY RUN: Would buy {qty}x {contract['symbol']} @ ${ask_per_share:.2f} = ${total_cost:.2f}")
+                order = {"order_id": "DRY_RUN", "symbol": contract["symbol"], "qty": qty, "side": "BUY", "submitted_at": datetime.now().isoformat(), "status": "dry_run"}
+            else:
+                order = buy_option_contract(client, contract["symbol"], qty)
 
             stop_premium = round(ask_per_share * (1 + STOP_LOSS_PCT), 2)
             target_premium = round(ask_per_share * (1 + TAKE_PROFIT_PCT), 2)
