@@ -1,0 +1,3 @@
+[submodule "pavano-loop"]
+	path = pavano-loop
+	url = https://github.com/misterpavano/pavano-loop.git
