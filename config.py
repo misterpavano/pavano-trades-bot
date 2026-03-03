@@ -22,7 +22,7 @@ CASH_RESERVE = 0          # always keep $200 in reserve
 MAX_CONTRACT_ASK = 3.00     # skip if ask > $2.00/share ($200/contract)
 OPTION_DTE_MIN = 7          # min days to expiry
 OPTION_DTE_MAX = 30         # max days to expiry
-OTM_PCT = 0.03              # target 3% OTM strikes
+OTM_PCT = 0.02              # target 2% OTM strikes
 
 TRADES_DIR = "/home/pavano/pavano-trades-bot/trades"
 SIGNALS_FILE = "/home/pavano/pavano-trades-bot/signals_output.json"

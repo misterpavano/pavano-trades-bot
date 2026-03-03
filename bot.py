@@ -279,7 +279,7 @@ def select_option_contract(ticker: str, direction: str, stock_price: float) -> d
     # Only fetch quotes for contracts near the target strike (reduce API calls)
     near_strike = [
         c for c in tradable
-        if abs(float(c["strike_price"]) - target_strike) / stock_price < 0.10
+        if abs(float(c["strike_price"]) - target_strike) / stock_price < 0.02
     ]
     if not near_strike:
         near_strike = tradable[:50]  # fallback: take first 50
@@ -376,6 +376,23 @@ def sell_option_position(client, contract_symbol: str, qty: int) -> dict:
 
 # ─── Modes ─────────────────────────────────────────────────────────────────────
 
+
+
+# ─── Macro Filter ──────────────────────────────────────────────────────────────
+
+def get_macro_bias(tradeable_signals: list) -> str:
+    """
+    Check if broad market (SPY + QQQ) signals are aligned SHORT.
+    If both are SHORT, suppress LONG trades — don't fight the tape.
+    Returns: 'bearish', 'bullish', or 'neutral'
+    """
+    macro_tickers = {"SPY", "QQQ"}
+    macro_sigs = {s["ticker"]: s.get("direction") for s in tradeable_signals if s["ticker"] in macro_tickers}
+    if len(macro_sigs) >= 2 and all(v == "SHORT" for v in macro_sigs.values()):
+        return "bearish"
+    if len(macro_sigs) >= 2 and all(v == "LONG" for v in macro_sigs.values()):
+        return "bullish"
+    return "neutral"
 
 # ─── Two-Shot Signal Loading ───────────────────────────────────────────────────
 
@@ -599,6 +616,7 @@ def mode_open():
                 order = {"order_id": "DRY_RUN", "symbol": contract["symbol"], "qty": qty, "side": "BUY", "submitted_at": datetime.now().isoformat(), "status": "dry_run"}
             else:
                 order = buy_option_contract(client, contract["symbol"], qty)
+            time.sleep(2)  # wait for Alpaca to settle before cash refresh
 
             stop_premium = round(ask_per_share * (1 + STOP_LOSS_PCT), 2)
             target_premium = round(ask_per_share * (1 + TAKE_PROFIT_PCT), 2)

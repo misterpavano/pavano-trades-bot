@@ -1,0 +1,14 @@
+{
+  "total_trades": 0,
+  "wins": 0,
+  "losses": 0,
+  "win_rate": 0,
+  "total_pnl": 0.0,
+  "by_signal_type": {
+    "options": {"trades": 0, "wins": 0, "pnl": 0.0},
+    "news": {"trades": 0, "wins": 0, "pnl": 0.0},
+    "politician": {"trades": 0, "wins": 0, "pnl": 0.0}
+  },
+  "by_ticker": {},
+  "last_updated": null
+}

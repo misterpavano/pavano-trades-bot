@@ -377,16 +377,19 @@ def get_news_score(ticker: str):
                     bear_hits += 1
 
         news_score = 0
+        news_direction = None
         top_headline = headlines[0] if headlines else "no headline"
 
         if bull_hits > bear_hits and len(results) >= 3:
             news_score = min(2, 1 + bull_hits // 3)
+            news_direction = "LONG"
         elif bear_hits > bull_hits and len(results) >= 3:
             news_score = min(2, 1 + bear_hits // 3)
+            news_direction = "SHORT"
         elif len(results) >= 5:
-            news_score = 1
+            news_score = 1  # neutral/mixed news, low weight
 
-        return news_score, top_headline
+        return news_score, top_headline, news_direction
 
     except Exception as e:
         log.warning(f"News fetch error for {ticker}: {e}")
@@ -404,7 +407,7 @@ def scan_all() -> list:
         opt_signal = get_options_signal(ticker)
         time.sleep(0.5)
 
-        news_score, top_headline = get_news_score(ticker)
+        news_score, top_headline, news_direction = get_news_score(ticker)
 
         pol_data = politician_scores.get(ticker, {})
         politician_score = pol_data.get("score", 0)
@@ -421,6 +424,13 @@ def scan_all() -> list:
         final_direction = opt_signal["direction"]
         if not final_direction and politician_score > 0:
             final_direction = "LONG"
+        # If options gave no direction, use news direction as tiebreaker
+        if not final_direction and news_direction:
+            final_direction = news_direction
+        # If options and news conflict, reduce news score contribution
+        if final_direction and news_direction and final_direction != news_direction:
+            news_score = max(0, news_score - 1)
+            log.info(f"  {ticker}: news direction ({news_direction}) conflicts with options ({final_direction}) — news score penalized")
 
         ma_trend = opt_signal.get("ma_trend", "neutral")
         sweep_note = ""

@@ -1,14 +1,17 @@
-{
-  "total_trades": 0,
-  "wins": 0,
-  "losses": 0,
-  "win_rate": 0,
-  "total_pnl": 0.0,
-  "by_signal_type": {
-    "options": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "news": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "politician": {"trades": 0, "wins": 0, "pnl": 0.0}
-  },
-  "by_ticker": {},
-  "last_updated": null
-}
+[
+  {
+    "date": "2026-03-03",
+    "ticker": "AAPL260318C00275000",
+    "entry": 0,
+    "exit": 1.49,
+    "pnl": -125.0,
+    "pnl_pct": -45.62,
+    "signal_score": 8,
+    "signal_type": "unknown",
+    "options_score": 0,
+    "news_score": 0,
+    "politician_score": 0,
+    "won": false,
+    "close_reason": "EOD close"
+  }
+]
