@@ -172,7 +172,9 @@ TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 def send_telegram(message: str):
-    payload = {"chat_id": TELEGRAM_GROUP, "text": message, "parse_mode": "Markdown"}
+    # Escape underscores outside of markdown bold/italic to prevent parse errors
+    safe_message = message.replace("_", "\\_")
+    payload = {"chat_id": TELEGRAM_GROUP, "text": safe_message, "parse_mode": "Markdown"}
     try:
         resp = requests.post(TELEGRAM_API, json=payload, timeout=10)
         if resp.ok:
