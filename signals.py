@@ -315,10 +315,23 @@ def get_options_signal(ticker: str) -> dict:
             sweep_bonus = min(1, sweep_puts * 0.5)
             options_score = min(6, int(base_score + sweep_bonus))
 
+        # ── Put/call premium ratio — standalone conviction factor ────────────
+        conviction_flag = None
+        if total_put_premium / (total_call_premium + 1) > 10:
+            options_score = min(6, options_score + 2)
+            direction = "SHORT"
+            conviction_flag = "HIGH_CONVICTION_SHORT"
+            log.info(f"{ticker}: HIGH_CONVICTION_SHORT — put premium {total_put_premium:.0f} >> call premium {total_call_premium:.0f}")
+        elif total_call_premium / (total_put_premium + 1) > 10:
+            options_score = min(6, options_score + 2)
+            conviction_flag = "HIGH_CONVICTION_LONG"
+            log.info(f"{ticker}: HIGH_CONVICTION_LONG — call premium {total_call_premium:.0f} >> put premium {total_put_premium:.0f}")
+
         return {
             "ticker": ticker,
             "options_score": options_score,
             "direction": direction,
+            "conviction_flag": conviction_flag,
             "ma_trend": ma_trend,
             "call_score": round(net_call_score, 2),
             "put_score": round(net_put_score, 2),
@@ -396,6 +409,47 @@ def get_news_score(ticker: str):
         return 0, "news error", None
 
 
+
+def check_consecutive_losses(ticker: str, trades_dir: str) -> bool:
+    """
+    Returns True if the ticker had consecutive losses (pnl < 0) on the last 2 trading days.
+    Looks at trade log files in trades_dir, excluding today's log.
+    """
+    import glob
+    from datetime import date as _date
+
+    today_str = _date.today().isoformat()
+    pattern = os.path.join(trades_dir, "????-??-??.json")
+    files = sorted(f for f in glob.glob(pattern)
+                   if os.path.basename(f).replace(".json", "") != today_str)
+
+    # Take the last 2 trading day logs
+    recent_files = files[-2:] if len(files) >= 2 else files
+    if len(recent_files) < 2:
+        return False  # Not enough history to determine
+
+    losses = []
+    for fpath in recent_files:
+        try:
+            with open(fpath) as f:
+                day_log = json.load(f)
+            day_trades = day_log.get("trades", [])
+            ticker_closed = [
+                t for t in day_trades
+                if t.get("underlying_ticker") == ticker and t.get("closed", False)
+            ]
+            if not ticker_closed:
+                return False  # No closed trade for this ticker that day — no pattern
+            all_loss = all(
+                t.get("pnl") is not None and t.get("pnl", 0) < 0
+                for t in ticker_closed
+            )
+            losses.append(all_loss)
+        except Exception:
+            return False
+
+    return len(losses) == 2 and all(losses)
+
 def scan_all() -> list:
     """Scan all watchlist tickers and return scored signals."""
     log.info(f"Starting scan of {len(WATCHLIST)} tickers...")
@@ -420,6 +474,11 @@ def scan_all() -> list:
         options_score = opt_signal["options_score"]
         total_score = options_score + news_score + politician_score
         total_score = min(10, total_score)
+
+        # ── Consecutive-loss cooldown ────────────────────────────────────────
+        cooldown_triggered = check_consecutive_losses(ticker, BASE_DIR + "/trades")
+        if cooldown_triggered:
+            log.info(f"  {ticker}: COOLDOWN — 2 consecutive losses on last 2 trading days")
 
         final_direction = opt_signal["direction"]
         if not final_direction and politician_score > 0:
@@ -457,7 +516,10 @@ def scan_all() -> list:
             "sweep_puts": opt_signal.get("sweep_puts", 0),
             "top_headline": top_headline,
             "options_detail": opt_signal.get("detail", ""),
-            "tradeable": total_score >= MIN_SIGNAL_SCORE and final_direction is not None,
+            "conviction_flag": opt_signal.get("conviction_flag"),
+            "tradeable": total_score >= MIN_SIGNAL_SCORE and final_direction is not None and not cooldown_triggered,
+            "cooldown": cooldown_triggered,
+            "cooldown_note": "COOLDOWN: 2 consecutive losses" if cooldown_triggered else "",
             "scanned_at": datetime.now().isoformat()
         }
         signals.append(signal)
