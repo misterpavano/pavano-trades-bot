@@ -376,6 +376,154 @@ def sell_option_position(client, contract_symbol: str, qty: int) -> dict:
 
 # ─── Modes ─────────────────────────────────────────────────────────────────────
 
+def mode_intraday():
+    """
+    Intraday check (runs at 12pm and 2pm ET): load all open positions from Alpaca,
+    close any that have hit the -50% stop loss or +100% take profit target.
+    """
+    log.info("=== MODE: INTRADAY (stop/target check) ===")
+    client = get_client()
+
+    positions = get_positions(client)
+    if not positions:
+        log.info("Intraday check: no open positions.")
+        return
+
+    log.info(f"Intraday check: {len(positions)} open position(s)")
+    daily_log = load_today_log()
+    closed_count = 0
+
+    for pos in positions:
+        symbol = pos["symbol"]
+        plpc = pos["unrealized_plpc"]
+        current_price = pos["current_price"]
+        unrealized_pl = pos["unrealized_pl"]
+        qty = abs(pos["qty"])
+
+        log.info(f"  {symbol}: P&L={plpc*100:+.1f}% current=${current_price:.2f}")
+
+        # Determine option type and underlying from symbol
+        option_type_label = "CALL" if "C" in symbol else "PUT"
+        underlying = symbol[:4] if len(symbol) > 4 else symbol
+
+        # Try to find entry info from today's log first
+        entry_trade = None
+        for trade in daily_log.get("trades", []):
+            if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+                entry_trade = trade
+                underlying = trade.get("underlying_ticker", underlying)
+                option_type_label = trade.get("option_type", option_type_label)
+                break
+
+        # If not found today, scan recent logs (position may have been opened on prior day)
+        if not entry_trade:
+            import glob as _glob
+            log_files = sorted(_glob.glob(os.path.join(TRADES_DIR, "????-??-??.json")), reverse=True)
+            for lf in log_files[:5]:
+                if os.path.basename(lf) == f"{TODAY}.json":
+                    continue
+                try:
+                    with open(lf) as f:
+                        old_log = json.load(f)
+                    for trade in old_log.get("trades", []):
+                        if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+                            entry_trade = trade
+                            underlying = trade.get("underlying_ticker", underlying)
+                            option_type_label = trade.get("option_type", option_type_label)
+                            break
+                    if entry_trade:
+                        break
+                except Exception:
+                    pass
+
+        # Evaluate stop / target
+        should_close = False
+        close_type = ""
+        reason = ""
+
+        if plpc <= STOP_LOSS_PCT:
+            should_close = True
+            close_type = "stop_loss"
+            reason = f"STOP -50% hit ({plpc*100:.1f}%)"
+        elif plpc >= TAKE_PROFIT_PCT:
+            should_close = True
+            close_type = "take_profit"
+            reason = f"TARGET +100% hit ({plpc*100:.1f}%)"
+
+        if not should_close:
+            continue
+
+        log.info(f"Closing {symbol}: {reason}")
+        try:
+            if DRY_RUN:
+                log.info(f"DRY RUN: Would sell {qty}x {symbol} @ ${current_price:.2f}")
+                order = {"order_id": "DRY_RUN", "symbol": symbol, "qty": int(qty), "side": "SELL"}
+            else:
+                order = sell_option_position(client, symbol, int(qty))
+
+            entry_time = None
+            if entry_trade:
+                entry_time = entry_trade.get("submitted_at")
+                entry_trade["closed"] = True
+                entry_trade["exit_price"] = current_price
+                entry_trade["close_reason"] = reason
+                entry_trade["pnl"] = unrealized_pl
+                entry_trade["pnl_pct"] = plpc * 100
+                entry_trade["closed_at"] = datetime.now().isoformat()
+
+            held = _held_duration(entry_time) if entry_time else "?"
+
+            try:
+                acct = get_account_info(client)
+                cash = acct["cash"]
+                portfolio = acct["portfolio_value"]
+            except Exception:
+                cash = portfolio = 0
+
+            emoji = "✅" if close_type == "take_profit" else "🔴"
+            reason_label = "TARGET HIT" if close_type == "take_profit" else "STOP HIT"
+            pnl_sign = "+" if unrealized_pl >= 0 else ""
+
+            msg = (
+                f"{emoji} INTRADAY CLOSE — {underlying} {option_type_label} [{reason_label}]\n"
+                f"📋 {symbol}\n"
+                f"💵 Sold @ ${current_price:.2f}/share\n"
+                f"📊 P&L: {pnl_sign}${unrealized_pl:.2f} ({plpc*100:+.1f}%)\n"
+                f"⏱ Held: {held}\n"
+                f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
+            )
+            send_telegram(msg)
+            append_trade_event({
+                "type": f"intraday_{close_type}",
+                "symbol": symbol,
+                "underlying": underlying,
+                "option_type": option_type_label,
+                "qty": int(qty),
+                "price": current_price,
+                "pnl": unrealized_pl,
+                "pnl_pct": plpc * 100,
+                "held": held,
+                "cash": cash,
+                "portfolio": portfolio,
+                "order_id": order["order_id"],
+                "reason": reason
+            })
+
+            closed_count += 1
+            time.sleep(0.5)
+
+        except Exception as e:
+            log.error(f"Failed to close {symbol}: {e}")
+
+    save_log(daily_log)
+
+    if closed_count == 0:
+        log.info("Intraday check complete — no positions hit stop/target.")
+    else:
+        log.info(f"Intraday check complete — closed {closed_count} position(s).")
+
+
+
 
 
 # ─── Macro Filter ──────────────────────────────────────────────────────────────
@@ -919,7 +1067,7 @@ def mode_close():
 
 def main():
     parser = argparse.ArgumentParser(description="Alpaca Options Trading Bot")
-    parser.add_argument("--mode", choices=["open", "monitor", "close"], required=True)
+    parser.add_argument("--mode", choices=["open", "monitor", "close", "intraday"], required=True)
     args = parser.parse_args()
 
     if args.mode == "open":
@@ -928,6 +1076,8 @@ def main():
         mode_monitor()
     elif args.mode == "close":
         mode_close()
+    elif args.mode == "intraday":
+        mode_intraday()
 
 
 if __name__ == "__main__":
