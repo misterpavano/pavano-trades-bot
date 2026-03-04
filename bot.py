@@ -380,19 +380,34 @@ def sell_option_position(client, contract_symbol: str, qty: int) -> dict:
 
 # ─── Macro Filter ──────────────────────────────────────────────────────────────
 
-def get_macro_bias(tradeable_signals: list) -> str:
+def get_macro_bias(data_client=None) -> str:
     """
-    Check if broad market (SPY + QQQ) signals are aligned SHORT.
-    If both are SHORT, suppress LONG trades — don't fight the tape.
+    Check live SPY + QQQ direction vs previous close at execution time.
+    If both are down on the day → bearish (suppress LONGs).
+    If both are up on the day → bullish (suppress SHORTs).
     Returns: 'bearish', 'bullish', or 'neutral'
     """
-    macro_tickers = {"SPY", "QQQ"}
-    macro_sigs = {s["ticker"]: s.get("direction") for s in tradeable_signals if s["ticker"] in macro_tickers}
-    if len(macro_sigs) >= 2 and all(v == "SHORT" for v in macro_sigs.values()):
-        return "bearish"
-    if len(macro_sigs) >= 2 and all(v == "LONG" for v in macro_sigs.values()):
-        return "bullish"
-    return "neutral"
+    try:
+        results = {}
+        for ticker in ["SPY", "QQQ"]:
+            tk = yf.Ticker(ticker)
+            info = tk.fast_info
+            current = info.last_price
+            prev = info.previous_close
+            if current and prev and prev > 0:
+                pct = (current - prev) / prev
+                results[ticker] = pct
+                log.info(f"Macro check {ticker}: {pct*100:+.2f}% vs prev close")
+        if len(results) < 2:
+            return "neutral"
+        if all(v < -0.005 for v in results.values()):  # both down >0.5%
+            return "bearish"
+        if all(v > 0.005 for v in results.values()):   # both up >0.5%
+            return "bullish"
+        return "neutral"
+    except Exception as e:
+        log.warning(f"Macro bias check failed: {e}")
+        return "neutral"
 
 # ─── Two-Shot Signal Loading ───────────────────────────────────────────────────
 

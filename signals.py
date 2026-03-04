@@ -357,7 +357,7 @@ def get_news_score(ticker: str):
         results = data.get("results", [])
 
         if not results:
-            return 0, "no news"
+            return 0, "no news", None
 
         bullish_kw = ["surge", "beat", "rally", "upgrade", "buy", "bullish", "record", "gain", "profit", "strong"]
         bearish_kw = ["crash", "drop", "miss", "downgrade", "sell", "bearish", "loss", "weak", "decline", "cut"]
@@ -393,7 +393,7 @@ def get_news_score(ticker: str):
 
     except Exception as e:
         log.warning(f"News fetch error for {ticker}: {e}")
-        return 0, "news error"
+        return 0, "news error", None
 
 
 def scan_all() -> list:
