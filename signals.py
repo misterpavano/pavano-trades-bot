@@ -410,6 +410,107 @@ def get_news_score(ticker: str):
 
 
 
+def get_earnings_data(ticker: str) -> dict:
+    """
+    Check upcoming earnings date and historical surprise pattern.
+
+    Returns:
+      days_to_earnings: int or None
+      earnings_risk: "DANGER" (<3 days) | "CAUTION" (3-7 days) | "CLEAR" | "UNKNOWN"
+      earnings_surprise_score: 0-2 (bonus for consistent beat history)
+      earnings_note: human-readable summary
+    """
+    try:
+        tk = yf.Ticker(ticker)
+
+        # ── Next earnings date ───────────────────────────────────────────────
+        days_to_earnings = None
+        earnings_risk = "UNKNOWN"
+        earnings_note = ""
+
+        try:
+            cal = tk.calendar
+            if cal is not None:
+                # yfinance returns a dict: {"Earnings Date": [date, ...], ...}
+                raw = None
+                if isinstance(cal, dict):
+                    earn_list = cal.get("Earnings Date")
+                    if earn_list:
+                        raw = earn_list[0] if isinstance(earn_list, list) else earn_list
+                elif hasattr(cal, "loc") and "Earnings Date" in cal.index:
+                    raw = cal.loc["Earnings Date"].iloc[0]
+                elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+                    raw = cal["Earnings Date"].iloc[0]
+
+                if raw is not None:
+                    if isinstance(raw, date) and not isinstance(raw, datetime):
+                        earn_date = raw
+                    elif hasattr(raw, "date"):
+                        earn_date = raw.date()
+                    else:
+                        earn_date = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+                    days_to_earnings = (earn_date - date.today()).days
+                    if days_to_earnings < 0:
+                        days_to_earnings = None  # Already passed
+        except Exception as e:
+            log.debug(f"{ticker} calendar error: {e}")
+
+        if days_to_earnings is not None:
+            if days_to_earnings <= 2:
+                earnings_risk = "DANGER"
+                earnings_note = f"⚠️ EARNINGS IN {days_to_earnings}d — IV crush risk, skip"
+            elif days_to_earnings <= 7:
+                earnings_risk = "CAUTION"
+                earnings_note = f"⚡ Earnings in {days_to_earnings}d — elevated IV, use caution"
+            else:
+                earnings_risk = "CLEAR"
+                earnings_note = f"Earnings in {days_to_earnings}d"
+        else:
+            earnings_risk = "UNKNOWN"
+
+        # ── Historical earnings surprise pattern ─────────────────────────────
+        earnings_surprise_score = 0
+        beat_streak = 0
+        try:
+            hist = tk.earnings_history
+            if hist is not None and not hist.empty and "surprisePercent" in hist.columns:
+                # Most recent 4 quarters
+                recent = hist.dropna(subset=["surprisePercent"]).tail(4)
+                beats = (recent["surprisePercent"] > 0).sum()
+                total = len(recent)
+                if total >= 3:
+                    beat_streak = beats
+                    if beats == total:
+                        earnings_surprise_score = 2  # Perfect beat record
+                        earnings_note += f" | Beat {beats}/{total} qtrs ✓✓"
+                    elif beats >= total - 1:
+                        earnings_surprise_score = 1  # Strong beat record
+                        earnings_note += f" | Beat {beats}/{total} qtrs ✓"
+                    elif beats <= 1:
+                        earnings_surprise_score = -1  # Consistent misser — penalty
+                        earnings_note += f" | Misser {total - beats}/{total} qtrs ✗"
+        except Exception as e:
+            log.debug(f"{ticker} earnings history error: {e}")
+
+        return {
+            "days_to_earnings": int(days_to_earnings) if days_to_earnings is not None else None,
+            "earnings_risk": earnings_risk,
+            "earnings_surprise_score": int(earnings_surprise_score),
+            "beat_streak": int(beat_streak),
+            "earnings_note": earnings_note.strip(" |"),
+        }
+
+    except Exception as e:
+        log.warning(f"Earnings check failed for {ticker}: {e}")
+        return {
+            "days_to_earnings": None,
+            "earnings_risk": "UNKNOWN",
+            "earnings_surprise_score": 0,
+            "beat_streak": 0,
+            "earnings_note": "",
+        }
+
+
 def check_consecutive_losses(ticker: str, trades_dir: str) -> bool:
     """
     Returns True if the ticker had consecutive losses (pnl < 0) on the last 2 trading days.
@@ -463,6 +564,12 @@ def scan_all() -> list:
 
         news_score, top_headline, news_direction = get_news_score(ticker)
 
+        earnings = get_earnings_data(ticker)
+        earnings_surprise_score = earnings["earnings_surprise_score"]
+        earnings_risk = earnings["earnings_risk"]
+        earnings_note = earnings["earnings_note"]
+        days_to_earnings = earnings["days_to_earnings"]
+
         pol_data = politician_scores.get(ticker, {})
         politician_score = pol_data.get("score", 0)
         politician_note = ""
@@ -472,8 +579,13 @@ def scan_all() -> list:
             politician_note = f"{count} congressional buy(s): {names}"
 
         options_score = opt_signal["options_score"]
-        total_score = options_score + news_score + politician_score
-        total_score = min(10, total_score)
+        total_score = options_score + news_score + politician_score + earnings_surprise_score
+        total_score = min(10, max(0, total_score))
+
+        # ── Earnings danger block ────────────────────────────────────────────
+        earnings_blocked = earnings_risk == "DANGER"
+        if earnings_blocked:
+            log.info(f"  {ticker}: EARNINGS DANGER — {earnings_note}")
 
         # ── Consecutive-loss cooldown ────────────────────────────────────────
         cooldown_triggered = check_consecutive_losses(ticker, BASE_DIR + "/trades")
@@ -517,16 +629,21 @@ def scan_all() -> list:
             "top_headline": top_headline,
             "options_detail": opt_signal.get("detail", ""),
             "conviction_flag": opt_signal.get("conviction_flag"),
-            "tradeable": total_score >= MIN_SIGNAL_SCORE and final_direction is not None and not cooldown_triggered,
+            "earnings_risk": earnings_risk,
+            "earnings_surprise_score": earnings_surprise_score,
+            "days_to_earnings": days_to_earnings,
+            "earnings_note": earnings_note,
+            "tradeable": total_score >= MIN_SIGNAL_SCORE and final_direction is not None and not cooldown_triggered and not earnings_blocked,
             "cooldown": cooldown_triggered,
             "cooldown_note": "COOLDOWN: 2 consecutive losses" if cooldown_triggered else "",
             "scanned_at": datetime.now().isoformat()
         }
         signals.append(signal)
         pol_info = f" 🏛️ pol={politician_score}" if politician_score > 0 else ""
+        earn_info = f" 📅 earn={earnings_surprise_score:+d}({earnings_risk})" if earnings_risk != "UNKNOWN" else ""
         log.info(
             f"  {ticker}: score={total_score} opt={options_score} news={news_score}"
-            f"{pol_info} dir={final_direction} ma={ma_trend}{sweep_note}"
+            f"{pol_info}{earn_info} dir={final_direction} ma={ma_trend}{sweep_note}"
         )
 
     signals.sort(key=lambda x: x["score"], reverse=True)
