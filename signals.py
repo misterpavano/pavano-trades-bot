@@ -10,7 +10,7 @@ Options scoring improvements (from community research):
   - OTM distance filter: deep OTM (>20%) = noise, near-OTM (1-10%) = high signal
   - Min premium threshold: aggregate call premium must be meaningful
   - Sweep detection: vol >> OI with large total volume = sweep signal
-  - MA trend filter: only score bullish options on MA5>MA10>MA20 uptrends
+  - MA trend filter: REMOVED — flow is the signal, TA is noise
 """
 
 import json
@@ -91,28 +91,6 @@ def load_politician_scores():
     return scores
 
 
-def get_ma_trend(tk, current_price):
-    """
-    Check MA5 > MA10 > MA20 bullish alignment (from stock_option_strategy).
-    Returns: 'bullish', 'bearish', or 'neutral'
-    """
-    try:
-        hist = tk.history(period="30d")
-        if hist.empty or len(hist) < 20:
-            return "neutral"
-        closes = hist["Close"].values
-        ma5 = closes[-5:].mean()
-        ma10 = closes[-10:].mean()
-        ma20 = closes[-20:].mean()
-        if ma5 > ma10 > ma20:
-            return "bullish"
-        elif ma5 < ma10 < ma20:
-            return "bearish"
-        return "neutral"
-    except Exception:
-        return "neutral"
-
-
 def dte_score_multiplier(days_to_expiry):
     """
     DTE-based scoring weight (inspired by stock_option_strategy).
@@ -191,9 +169,6 @@ def get_options_signal(ticker: str) -> dict:
             current_price = info.last_price
         except Exception:
             pass
-
-        # Get MA trend for quality filter
-        ma_trend = get_ma_trend(tk, current_price)
 
         total_call_score = 0.0
         total_put_score = 0.0
@@ -297,12 +272,6 @@ def get_options_signal(ticker: str) -> dict:
         net_call_score = total_call_score
         net_put_score = total_put_score
 
-        # MA trend confirmation: boost aligned flow, penalize divergent flow
-        if ma_trend == "bullish" and net_call_score > net_put_score:
-            net_call_score *= 1.2
-        elif ma_trend == "bearish" and net_put_score > net_call_score:
-            net_put_score *= 1.2
-
         # Minimum premium check — filter out low-notional noise
         if net_call_score > net_put_score and total_call_premium >= MIN_AGGREGATE_PREMIUM:
             direction = "LONG"
@@ -332,7 +301,6 @@ def get_options_signal(ticker: str) -> dict:
             "options_score": options_score,
             "direction": direction,
             "conviction_flag": conviction_flag,
-            "ma_trend": ma_trend,
             "call_score": round(net_call_score, 2),
             "put_score": round(net_put_score, 2),
             "call_premium_est": int(total_call_premium),
@@ -603,7 +571,6 @@ def scan_all() -> list:
             news_score = max(0, news_score - 1)
             log.info(f"  {ticker}: news direction ({news_direction}) conflicts with options ({final_direction}) — news score penalized")
 
-        ma_trend = opt_signal.get("ma_trend", "neutral")
         sweep_note = ""
         sc = opt_signal.get("sweep_calls", 0)
         sp = opt_signal.get("sweep_puts", 0)
@@ -618,7 +585,6 @@ def scan_all() -> list:
             "politician_score": round(politician_score, 2),
             "politician_note": politician_note,
             "direction": final_direction,
-            "ma_trend": ma_trend,
             "current_price": opt_signal.get("current_price"),
             "call_score": opt_signal.get("call_score", 0),
             "put_score": opt_signal.get("put_score", 0),
@@ -643,7 +609,7 @@ def scan_all() -> list:
         earn_info = f" 📅 earn={earnings_surprise_score:+d}({earnings_risk})" if earnings_risk != "UNKNOWN" else ""
         log.info(
             f"  {ticker}: score={total_score} opt={options_score} news={news_score}"
-            f"{pol_info}{earn_info} dir={final_direction} ma={ma_trend}{sweep_note}"
+            f"{pol_info}{earn_info} dir={final_direction}{sweep_note}"
         )
 
     signals.sort(key=lambda x: x["score"], reverse=True)
@@ -671,7 +637,7 @@ def main():
         sweep = f" 🌊 {s['sweep_calls']}C/{s['sweep_puts']}P sweeps" if (s.get('sweep_calls') or s.get('sweep_puts')) else ""
         log.info(
             f"  ✅ {s['ticker']} score={s['score']} dir={s['direction']} "
-            f"price=${s['current_price']} ma={s['ma_trend']}{pol}{sweep}"
+            f"price=${s['current_price']}{pol}{sweep}"
         )
 
     output = {
