@@ -493,6 +493,7 @@ def mode_intraday():
                 f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
             )
             send_telegram(msg)
+            fire_trade_hook(f"CLOSE ({close_type.upper()})", f"{option_type_label} {symbol} pnl={pnl_sign}${unrealized_pl:.2f} ({plpc*100:+.1f}%)")
             append_trade_event({
                 "type": f"intraday_{close_type}",
                 "symbol": symbol,
@@ -831,6 +832,7 @@ def mode_open():
                 f"💵 Cash remaining: ${cash_remaining:.2f}"
             )
             send_telegram(msg)
+            fire_trade_hook("BUY", f"{option_type_label} {ticker} strike={strike} exp={exp_date} qty={qty} @${ask:.2f}/sh")
             append_trade_event({
                 "type": "options_buy",
                 "underlying": ticker,
@@ -949,6 +951,7 @@ def mode_monitor():
                     f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
                 )
                 send_telegram(msg)
+                fire_trade_hook(f"CLOSE ({close_type.upper()})", f"{option_type_label} {symbol} pnl={pnl_pct_sign}{pnl_pct_abs:.1f}%")
                 append_trade_event({
                     "type": close_type,
                     "symbol": symbol,
@@ -1030,6 +1033,7 @@ def mode_close():
                 f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
             )
             send_telegram(msg)
+            fire_trade_hook("EOD CLOSE", f"{option_type_label} {symbol} pnl={pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)")
             append_trade_event({
                 "type": "eod_close",
                 "symbol": symbol,
@@ -1063,6 +1067,39 @@ def mode_close():
             log.warning(f"learn.py error: {result.stderr[:200]}")
     except Exception as e:
         log.error(f"Failed to run learn.py: {e}")
+
+
+# --- Pavano Hook Integration ---
+import urllib.request as _urllib_req
+import urllib.parse as _urllib_parse
+import json as _json
+
+def fire_trade_hook(event_type: str, details: str):
+    """Fire an isolated agent run via OpenClaw webhook ingress on trade events."""
+    try:
+        msg = f"[Trade Event] {event_type}: {details}\n\nLog this trade event to the Pavano Trades Telegram group (-5191423233) with appropriate emoji. Keep it brief — one line max."
+        payload = {
+            "message": msg,
+            "name": "TradeFill",
+            "wakeMode": "now",
+            "deliver": True,
+            "channel": "telegram",
+            "to": "-5191423233",
+            "model": "anthropic/claude-haiku-4-5"
+        }
+        data = _json.dumps(payload).encode()
+        req = _urllib_req.Request(
+            "http://127.0.0.1:18789/hooks/agent",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer pavano-hook-token-2026"
+            }
+        )
+        _urllib_req.urlopen(req, timeout=5)
+        log.info(f"fire_trade_hook: sent {event_type}")
+    except Exception as e:
+        log.warning(f"fire_trade_hook failed (non-critical): {e}")
 
 
 def main():
