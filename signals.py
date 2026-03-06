@@ -319,9 +319,11 @@ def get_options_signal(ticker: str) -> dict:
 def get_news_score(ticker: str):
     """Fetch news from SearXNG and score catalyst strength."""
     try:
+        # Known mappings for better search quality — falls back to "{TICKER} stock"
         company_names = {
             "SPY": "S&P 500 ETF market",
             "QQQ": "Nasdaq QQQ ETF market",
+            "IWM": "Russell 2000 ETF market",
             "AAPL": "Apple stock",
             "TSLA": "Tesla stock",
             "NVDA": "Nvidia stock",
@@ -329,7 +331,14 @@ def get_news_score(ticker: str):
             "MSFT": "Microsoft stock",
             "META": "Meta stock",
             "GME": "GameStop stock",
-            "AMZN": "Amazon stock"
+            "AMZN": "Amazon stock",
+            "GOOG": "Google Alphabet stock",
+            "GOOGL": "Google Alphabet stock",
+            "NFLX": "Netflix stock",
+            "BABA": "Alibaba stock",
+            "COIN": "Coinbase stock",
+            "PLTR": "Palantir stock",
+            "ARM": "ARM Holdings stock",
         }
         query = company_names.get(ticker, f"{ticker} stock")
         url = f"{SEARXNG_URL}?q={requests.utils.quote(query)}&format=json&time_range=day&categories=news"
@@ -481,8 +490,9 @@ def get_earnings_data(ticker: str) -> dict:
 
 def check_consecutive_losses(ticker: str, trades_dir: str) -> bool:
     """
-    Returns True if the ticker had consecutive losses (pnl < 0) on the last 2 trading days.
-    Looks at trade log files in trades_dir, excluding today's log.
+    Returns True if the ticker had ANY loss in the last 2 trading day logs.
+    One loss = 1-day cooldown. Two losses = still on cooldown (2 days looked back).
+    Does NOT require closed=True — checks pnl field directly so Bug 2 doesn't cascade here.
     """
     import glob
     from datetime import date as _date
@@ -492,40 +502,66 @@ def check_consecutive_losses(ticker: str, trades_dir: str) -> bool:
     files = sorted(f for f in glob.glob(pattern)
                    if os.path.basename(f).replace(".json", "") != today_str)
 
-    # Take the last 2 trading day logs
+    # Look at the last 2 trading day logs
     recent_files = files[-2:] if len(files) >= 2 else files
-    if len(recent_files) < 2:
-        return False  # Not enough history to determine
+    if not recent_files:
+        return False
 
-    losses = []
     for fpath in recent_files:
         try:
             with open(fpath) as f:
                 day_log = json.load(f)
             day_trades = day_log.get("trades", [])
-            ticker_closed = [
+            ticker_trades = [
                 t for t in day_trades
-                if t.get("underlying_ticker") == ticker and t.get("closed", False)
+                if t.get("underlying_ticker") == ticker
             ]
-            if not ticker_closed:
-                return False  # No closed trade for this ticker that day — no pattern
-            all_loss = all(
-                t.get("pnl") is not None and t.get("pnl", 0) < 0
-                for t in ticker_closed
-            )
-            losses.append(all_loss)
+            for t in ticker_trades:
+                pnl = t.get("pnl")
+                # A trade counts as a loss if: pnl is set and negative,
+                # OR it was closed with a negative pnl_pct
+                pnl_pct = t.get("pnl_pct")
+                if (pnl is not None and pnl < 0) or (pnl_pct is not None and pnl_pct < 0):
+                    log.info(f"{ticker}: COOLDOWN triggered — loss found in {os.path.basename(fpath)} (pnl={pnl}, pnl_pct={pnl_pct})")
+                    return True
         except Exception:
-            return False
+            pass
 
-    return len(losses) == 2 and all(losses)
+    return False
+
+def get_dynamic_universe(n: int = 30) -> list:
+    """
+    Pull top tickers by options volume from Yahoo Finance screener.
+    Falls back to WATCHLIST if the screener is unavailable.
+    Returns a deduped list of tickers.
+    """
+    tickers = []
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        params = {"scrIds": "most_actives", "count": n, "formatted": "false"}
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        data = resp.json()
+        quotes = data["finance"]["result"][0]["quotes"]
+        tickers = [q["symbol"] for q in quotes if q.get("symbol")]
+        log.info(f"Dynamic universe: {len(tickers)} tickers from Yahoo options screener")
+    except Exception as e:
+        log.warning(f"Options screener failed ({e}), falling back to WATCHLIST")
+
+    # Always include watchlist tickers (for politician tracking + baseline)
+    combined = list(dict.fromkeys(tickers + WATCHLIST))[:n]
+    log.info(f"Final scan universe ({len(combined)}): {combined}")
+    return combined
+
 
 def scan_all() -> list:
-    """Scan all watchlist tickers and return scored signals."""
-    log.info(f"Starting scan of {len(WATCHLIST)} tickers...")
+    """Scan dynamic options-active universe and return scored signals."""
+    universe = get_dynamic_universe(n=30)
+    log.info(f"Starting scan of {len(universe)} tickers...")
     politician_scores = load_politician_scores()
     signals = []
 
-    for ticker in WATCHLIST:
+    for ticker in universe:
         log.info(f"Scanning {ticker}...")
         opt_signal = get_options_signal(ticker)
         time.sleep(0.5)

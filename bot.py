@@ -985,6 +985,8 @@ def mode_close():
 
     daily_log = load_today_log()
 
+    import glob as _glob
+
     for pos in positions:
         symbol = pos["symbol"]
         qty = abs(pos["qty"])
@@ -1001,6 +1003,8 @@ def mode_close():
         try:
             order = sell_option_position(client, symbol, int(qty))
 
+            # Search today's log first, then scan recent logs for prior-day positions
+            found_in_log = False
             for trade in daily_log["trades"]:
                 if trade.get("contract_symbol") == symbol and not trade.get("closed"):
                     underlying = trade.get("underlying_ticker", underlying)
@@ -1011,7 +1015,42 @@ def mode_close():
                     trade["pnl"] = unrealized_pl
                     trade["pnl_pct"] = plpc * 100
                     trade["closed_at"] = datetime.now().isoformat()
+                    found_in_log = True
                     break
+
+            if not found_in_log:
+                # Position was opened on a prior day — find and update that log
+                log_files = sorted(
+                    _glob.glob(os.path.join(TRADES_DIR, "????-??-??.json")), reverse=True
+                )
+                for lf in log_files[:5]:
+                    if os.path.basename(lf) == f"{TODAY}.json":
+                        continue
+                    try:
+                        with open(lf) as f:
+                            prior_log = json.load(f)
+                        for trade in prior_log.get("trades", []):
+                            if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+                                underlying = trade.get("underlying_ticker", underlying)
+                                option_type_label = trade.get("option_type", option_type_label)
+                                trade["closed"] = True
+                                trade["exit_price"] = current_price
+                                trade["close_reason"] = "EOD close"
+                                trade["pnl"] = unrealized_pl
+                                trade["pnl_pct"] = plpc * 100
+                                trade["closed_at"] = datetime.now().isoformat()
+                                with open(lf, "w") as f:
+                                    json.dump(prior_log, f, indent=2)
+                                log.info(f"Updated prior-day log {os.path.basename(lf)} for {symbol}")
+                                found_in_log = True
+                                break
+                        if found_in_log:
+                            break
+                    except Exception as e:
+                        log.warning(f"Could not update prior log {lf}: {e}")
+
+            if not found_in_log:
+                log.warning(f"No trade record found for {symbol} in today's or recent logs")
 
             try:
                 acct = get_account_info(client)

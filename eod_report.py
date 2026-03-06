@@ -88,7 +88,7 @@ def build_report(account: dict, daily_log: dict) -> str:
     winning_signals = {}
     for t in trades:
         symbol = t["symbol"]
-        entry = t.get("entry_price", 0)
+        entry = t.get("ask_at_entry") or t.get("entry_price") or 0  # field is ask_at_entry in trade records
         if t.get("closed"):
             exit_p = t.get("exit_price", 0)
             pnl_pct = t.get("pnl_pct", 0)
