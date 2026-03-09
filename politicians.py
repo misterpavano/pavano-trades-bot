@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 politicians.py — Congressional trade tracker
-Fetches House PTR (Periodic Transaction Report) filings directly from the House Clerk.
-This approach works from VPS/cloud IPs unlike the S3 buckets.
+Fetches congressional trades from Quiver Quant (no API key needed, works from VPS).
 
 Data sources (tried in order):
-  1. House Clerk PTR PDFs (primary — works from VPS)
-  2. House Stock Watcher S3 (fallback — residential IPs only)
-  3. Senate Stock Watcher S3 (fallback — residential IPs only)
+  1. Quiver Quant /beta/live/congresstrading (primary — works from VPS, no auth)
+  2. House Clerk PTR PDFs (secondary — 500ing as of 2026-03-09)
+  3. House Stock Watcher S3 (fallback — residential IPs only, 403 from VPS)
+  4. Senate Stock Watcher S3 (fallback — residential IPs only, 403 from VPS)
 
 Scoring enhancements:
   - Multi-politician convergence: multiple members buying same ticker = boost
@@ -38,6 +38,7 @@ LARGE_PURCHASE_THRESHOLD = 50_000
 LOOKBACK_DAYS = 30
 
 # Data sources
+QUIVER_QUANT_URL = "https://api.quiverquant.com/beta/live/congresstrading"
 HOUSE_CLERK_SEARCH_URL = "https://disclosures-clerk.house.gov/FinancialDisclosure/ViewMemberSearchResult"
 HOUSE_PTR_BASE_URL = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs"
 HOUSE_S3_URLS = [
@@ -329,6 +330,62 @@ def normalize_senate(tx):
 
 
 # ---------------------------------------------------------------------------
+# Quiver Quant (primary — works from VPS, no auth required)
+# ---------------------------------------------------------------------------
+
+def fetch_quiver_quant():
+    """Fetch congressional trades from Quiver Quant API (free, no key needed)."""
+    try:
+        resp = requests.get(
+            QUIVER_QUANT_URL,
+            headers={"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        log.info(f"Quiver Quant: {len(data)} total records")
+    except Exception as e:
+        log.error(f"Quiver Quant fetch error: {e}")
+        return []
+
+    transactions = []
+    for tx in data:
+        try:
+            tx_type = (tx.get("Transaction") or "").lower()
+            if "purchase" not in tx_type:
+                continue
+            ticker = (tx.get("Ticker") or "").upper().strip()
+            if not ticker or ticker == "--":
+                continue
+            date_str = tx.get("TransactionDate") or tx.get("ReportDate") or ""
+            if not date_str:
+                continue
+            tx_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            if (date.today() - tx_date).days > LOOKBACK_DAYS:
+                continue
+            name = tx.get("Representative") or "Unknown"
+            chamber = tx.get("House") or "Unknown"
+            party = tx.get("Party") or ""
+            amount_str = tx.get("Range") or ""
+            amount = parse_amount(tx.get("Amount") or amount_str)
+            transactions.append({
+                "name": name,
+                "party": party,
+                "chamber": chamber,
+                "ticker": ticker,
+                "date": str(tx_date),
+                "amount_str": amount_str,
+                "amount": amount,
+                "tx_id": make_tx_id(name, ticker, str(tx_date)),
+            })
+        except Exception:
+            continue
+
+    log.info(f"Quiver Quant: {len(transactions)} purchase transactions in last {LOOKBACK_DAYS} days")
+    return transactions
+
+
+# ---------------------------------------------------------------------------
 # Signal aggregation
 # ---------------------------------------------------------------------------
 
@@ -394,16 +451,25 @@ def main():
     all_normalized = []
     source_used = "none"
 
-    # Primary: House Clerk PTR PDFs (works from VPS)
-    house_clerk_txs = fetch_house_clerk()
-    if house_clerk_txs:
-        all_normalized.extend(house_clerk_txs)
-        source_used = "house_clerk_pdf"
-        log.info(f"Primary source: {len(house_clerk_txs)} House transactions from PTR PDFs")
+    # Primary: Quiver Quant (works from VPS, no auth required)
+    qq_txs = fetch_quiver_quant()
+    if qq_txs:
+        all_normalized.extend(qq_txs)
+        source_used = "quiver_quant"
+        log.info(f"Primary source: {len(qq_txs)} purchase transactions from Quiver Quant")
 
-    # Fallback: S3 sources (residential only)
+    # Secondary: House Clerk PTR PDFs (may 500 on gov servers)
     if not all_normalized:
-        log.info("Primary source empty — trying S3 fallback...")
+        log.info("Quiver Quant empty — trying House Clerk PTR PDFs...")
+        house_clerk_txs = fetch_house_clerk()
+        if house_clerk_txs:
+            all_normalized.extend(house_clerk_txs)
+            source_used = "house_clerk_pdf"
+            log.info(f"Secondary source: {len(house_clerk_txs)} House transactions from PTR PDFs")
+
+    # Fallback: S3 sources (residential only — 403 from VPS/cloud)
+    if not all_normalized:
+        log.info("All primary sources empty — trying S3 fallback (likely blocked)...")
         house_raw = fetch_json(HOUSE_S3_URLS, "House S3")
         senate_raw = fetch_json(SENATE_S3_URLS, "Senate S3")
         for tx in house_raw:
