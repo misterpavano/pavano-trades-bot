@@ -10,7 +10,7 @@ SEARXNG_URL = "http://127.0.0.1:8888/search"
 
 WATCHLIST = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META", "GME", "AMZN"]
 
-STARTING_CAPITAL = 500.0
+STARTING_CAPITAL = 1000.0
 MAX_POSITIONS = 5           # max 3 open option positions at once
 MIN_SIGNAL_SCORE = 5        # Only trade if score >= 5
 
