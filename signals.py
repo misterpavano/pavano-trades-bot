@@ -65,6 +65,9 @@ POLITICIANS_LATEST = os.path.join(BASE_DIR, "knowledge", "politicians", "latest.
 # ── Options signal thresholds ────────────────────────────────────────────────
 MIN_OPTION_VOLUME = 500          # Raised from 250 — tighter noise filter
 MIN_AGGREGATE_PREMIUM = 200_000  # Raised from $50K — $200K+ signals institutional intent
+MIN_OPEN_INTEREST = 100          # Ignore contracts with OI < 100 (data artifacts + unconfirmed positions)
+MIN_QUALIFYING_CONTRACTS = 2     # Ticker needs unusual flow on >= 2 contracts before it fires
+SHORT_SCORE_PENALTY = 0.70       # Put flow gets 30% haircut — hedges are common, short signals noisier
 MAX_OTM_PCT = 0.20               # Ignore options more than 20% OTM (lottery tickets)
 NEAR_OTM_MAX_PCT = 0.10          # Near-OTM: within 10% of current price
 SWEEP_VOL_MULTIPLIER = 5.0       # Vol > 5x OI = likely sweep (aggressive buyer)
@@ -176,6 +179,8 @@ def get_options_signal(ticker: str) -> dict:
         total_put_premium = 0
         sweep_calls = 0
         sweep_puts = 0
+        qualifying_call_contracts = 0  # recurrence counter
+        qualifying_put_contracts = 0   # recurrence counter
         unusual_details = []
 
         for exp, days_out in valid_expiries[:3]:
@@ -195,6 +200,10 @@ def get_options_signal(ticker: str) -> dict:
                     if vol < MIN_OPTION_VOLUME:
                         continue
 
+                    # Minimum OI filter — eliminates data artifacts and unconfirmed positions
+                    if oi < MIN_OPEN_INTEREST:
+                        continue
+
                     # OTM quality filter
                     if current_price:
                         otm_mult = otm_quality_score(strike, current_price, is_call=True)
@@ -203,15 +212,14 @@ def get_options_signal(ticker: str) -> dict:
                     else:
                         otm_mult = 1.0
 
-                    # Volume vs OI check
-                    unusual = (oi > 0 and vol > oi * UNUSUAL_VOLUME_MULTIPLIER) or \
-                              (oi == 0 and vol > 500)
-                    if not unusual:
+                    # Volume vs OI check (OI guaranteed > 0 now)
+                    if vol <= oi * UNUSUAL_VOLUME_MULTIPLIER:
                         continue
 
                     # Aggregate premium (vol * ask * 100 = notional value)
                     notional = vol * ask * 100
                     total_call_premium += notional
+                    qualifying_call_contracts += 1
 
                     # Base score: 1 + OTM quality + DTE weight
                     row_score = 1.0 * otm_mult * dte_mult
@@ -236,6 +244,10 @@ def get_options_signal(ticker: str) -> dict:
                     if vol < MIN_OPTION_VOLUME:
                         continue
 
+                    # Minimum OI filter
+                    if oi < MIN_OPEN_INTEREST:
+                        continue
+
                     if current_price:
                         otm_mult = otm_quality_score(strike, current_price, is_call=False)
                         if otm_mult == 0:
@@ -243,15 +255,16 @@ def get_options_signal(ticker: str) -> dict:
                     else:
                         otm_mult = 1.0
 
-                    unusual = (oi > 0 and vol > oi * UNUSUAL_VOLUME_MULTIPLIER) or \
-                              (oi == 0 and vol > 500)
-                    if not unusual:
+                    # Volume vs OI check
+                    if vol <= oi * UNUSUAL_VOLUME_MULTIPLIER:
                         continue
 
                     notional = vol * ask * 100
                     total_put_premium += notional
+                    qualifying_put_contracts += 1
 
-                    row_score = 1.0 * otm_mult * dte_mult
+                    # Apply SHORT penalty — put flow is frequently hedging, not directional
+                    row_score = 1.0 * otm_mult * dte_mult * SHORT_SCORE_PENALTY
                     if is_sweep(vol, oi):
                         sweep_puts += 1
                         row_score *= 1.3
@@ -272,13 +285,17 @@ def get_options_signal(ticker: str) -> dict:
         net_call_score = total_call_score
         net_put_score = total_put_score
 
-        # Minimum premium check — filter out low-notional noise
-        if net_call_score > net_put_score and total_call_premium >= MIN_AGGREGATE_PREMIUM:
+        # Minimum premium + recurrence check — filter out lone fat prints and low-notional noise
+        if (net_call_score > net_put_score
+                and total_call_premium >= MIN_AGGREGATE_PREMIUM
+                and qualifying_call_contracts >= MIN_QUALIFYING_CONTRACTS):
             direction = "LONG"
             base_score = 2 + min(3, net_call_score)
             sweep_bonus = min(1, sweep_calls * 0.5)
             options_score = min(6, int(base_score + sweep_bonus))
-        elif net_put_score > net_call_score and total_put_premium >= MIN_AGGREGATE_PREMIUM:
+        elif (net_put_score > net_call_score
+                and total_put_premium >= MIN_AGGREGATE_PREMIUM
+                and qualifying_put_contracts >= MIN_QUALIFYING_CONTRACTS):
             direction = "SHORT"
             base_score = 2 + min(3, net_put_score)
             sweep_bonus = min(1, sweep_puts * 0.5)
@@ -307,6 +324,8 @@ def get_options_signal(ticker: str) -> dict:
             "put_premium_est": int(total_put_premium),
             "sweep_calls": sweep_calls,
             "sweep_puts": sweep_puts,
+            "qualifying_call_contracts": qualifying_call_contracts,
+            "qualifying_put_contracts": qualifying_put_contracts,
             "current_price": current_price,
             "detail": "; ".join(unusual_details[:3]) if unusual_details else "no unusual flow"
         }
