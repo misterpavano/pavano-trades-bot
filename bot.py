@@ -276,13 +276,18 @@ def select_option_contract(ticker: str, direction: str, stock_price: float) -> d
         log.info(f"No tradable contracts for {ticker}")
         return None
 
-    # Only fetch quotes for contracts near the target strike (reduce API calls)
+    # Only fetch quotes for contracts near the target strike (within 5%)
     near_strike = [
         c for c in tradable
-        if abs(float(c["strike_price"]) - target_strike) / stock_price < 0.02
+        if abs(float(c["strike_price"]) - target_strike) / stock_price < 0.05
     ]
     if not near_strike:
-        near_strike = tradable[:50]  # fallback: take first 50
+        # Fallback: sort all tradable by proximity to target strike, take closest 50
+        near_strike = sorted(
+            tradable,
+            key=lambda c: abs(float(c["strike_price"]) - target_strike)
+        )[:50]
+        log.info(f"No contracts within 5% of target strike — using closest 50 by strike proximity")
 
     symbols = [c["symbol"] for c in near_strike]
     ask_prices = get_option_ask_prices(symbols)
@@ -660,39 +665,26 @@ def mode_open():
                 log.info(f"Open scan signal added: {s['ticker']}")
 
     if not tradeable:
-        # Gap check rejected everything — fall back to top scoring signals ignoring gap filter
+        # Gap check rejected everything — do NOT bypass. No trade is the right trade.
         all_sigs = []
         if eod_signals: all_sigs += eod_signals.get("tradeable", [])
         if open_signals: all_sigs += open_signals.get("tradeable", [])
         if not all_sigs:
             if eod_signals: all_sigs += eod_signals.get("signals", [])
             if open_signals: all_sigs += open_signals.get("signals", [])
-        if not all_sigs:
-            log.error("No signals found at all. Run signals.py first.")
-            sys.exit(1)
-        # Use top signals by score, gap check bypassed
-        seen = set()
-        for s in sorted(all_sigs, key=lambda x: x.get("score", 0), reverse=True):
-            if s["ticker"] not in seen and s.get("score", 0) >= MIN_SIGNAL_SCORE:
-                s["signal_source"] = "EOD flow (gap bypass)"
-                s["confirmation_note"] = "gap check bypassed — all signals gap-rejected"
-                tradeable.append(s)
-                seen.add(s["ticker"])
-            if len(tradeable) >= 3:
-                break
-        if not tradeable:
-            watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in all_sigs[:5]) if all_sigs else "none"
-            msg = (
-                f"📊 No trades today — signals below minimum score.\n"
-                f"Watching: {watching}\n"
-                f"💵 Options BP: ${account['options_buying_power']:.2f}"
-            )
-            send_telegram(msg)
-            daily_log = load_today_log()
-            daily_log["notes"] = "No signals met minimum score"
-            save_log(daily_log)
-            return
-        log.info(f"Gap bypass: using {len(tradeable)} signals after gap check rejected all")
+
+        watching = ", ".join(f"{s['ticker']} ({s.get('score',0):.1f})" for s in all_sigs[:5]) if all_sigs else "none"
+        msg = (
+            f"📊 No trades today — gap check rejected all signals.\n"
+            f"Watching: {watching}\n"
+            f"💵 Options BP: ${account['options_buying_power']:.2f}"
+        )
+        log.info("Gap check rejected all signals — no trades (bypass removed)")
+        send_telegram(msg)
+        daily_log = load_today_log()
+        daily_log["notes"] = "Gap check rejected all signals — no trades"
+        save_log(daily_log)
+        return
 
     existing_positions = get_positions(client)
     open_count = len(existing_positions)
@@ -871,118 +863,6 @@ def mode_open():
     log.info(f"Open mode complete. {len(daily_log['trades'])} option trades placed.")
 
 
-def mode_monitor():
-    """Check stop loss and take profit on open options positions."""
-    log.info("=== MODE: MONITOR (options) ===")
-    client = get_client()
-
-    daily_log = load_today_log()
-    positions = get_positions(client)
-
-    if not positions:
-        log.info("No open positions to monitor.")
-        return
-
-    for pos in positions:
-        symbol = pos["symbol"]
-        plpc = pos["unrealized_plpc"]
-        current_price = pos["current_price"]  # per-share option price
-        unrealized_pl = pos["unrealized_pl"]
-        qty = abs(pos["qty"])
-
-        log.info(f"{symbol}: current=${current_price:.2f}/sh P&L%={plpc*100:.2f}%")
-
-        # Find entry info from log
-        entry_trade = None
-        for trade in daily_log["trades"]:
-            if trade.get("contract_symbol") == symbol and not trade.get("closed"):
-                entry_trade = trade
-                break
-
-        # Determine option type label
-        option_type_label = "CALL" if "C" in symbol else "PUT"
-        # Extract underlying from symbol or trade log
-        underlying = entry_trade["underlying_ticker"] if entry_trade else symbol[:4]
-
-        should_close = False
-        reason = ""
-        close_type = ""
-
-        if plpc <= STOP_LOSS_PCT:
-            should_close = True
-            reason = f"stop loss hit ({plpc*100:.1f}%)"
-            close_type = "stop_loss"
-        elif plpc >= TAKE_PROFIT_PCT:
-            should_close = True
-            reason = f"take profit hit ({plpc*100:.1f}%)"
-            close_type = "take_profit"
-
-        if should_close:
-            log.info(f"Closing {symbol}: {reason}")
-            try:
-                order = sell_option_position(client, symbol, int(qty))
-
-                entry_time = None
-                if entry_trade:
-                    entry_time = entry_trade.get("submitted_at")
-                    entry_trade["closed"] = True
-                    entry_trade["exit_price"] = current_price
-                    entry_trade["close_reason"] = reason
-                    entry_trade["pnl"] = unrealized_pl
-                    entry_trade["pnl_pct"] = plpc * 100
-                    entry_trade["closed_at"] = datetime.now().isoformat()
-
-                held = _held_duration(entry_time) if entry_time else "?"
-                pnl_sign = "+" if unrealized_pl >= 0 else "-"
-                pnl_pct_sign = "+" if plpc >= 0 else "-"
-                pnl_abs = abs(unrealized_pl)
-                pnl_pct_abs = abs(plpc * 100)
-
-                try:
-                    acct = get_account_info(client)
-                    cash = acct["cash"]
-                    portfolio = acct["portfolio_value"]
-                except Exception:
-                    cash = portfolio = 0
-
-                if close_type == "take_profit":
-                    emoji = "✅"
-                    reason_label = "TARGET HIT"
-                else:
-                    emoji = "🔴"
-                    reason_label = "STOP HIT"
-
-                msg = (
-                    f"{emoji} OPTIONS SOLD — {underlying} {option_type_label} [{reason_label}]\n"
-                    f"📋 {symbol}\n"
-                    f"💵 Sold @ ${current_price:.2f}/share\n"
-                    f"📊 P&L: {pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)\n"
-                    f"⏱ Held: {held}\n"
-                    f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
-                )
-                send_telegram(msg)
-                fire_trade_hook(f"CLOSE ({close_type.upper()})", f"{option_type_label} {symbol} pnl={pnl_pct_sign}{pnl_pct_abs:.1f}%")
-                append_trade_event({
-                    "type": close_type,
-                    "symbol": symbol,
-                    "underlying": underlying,
-                    "option_type": option_type_label,
-                    "qty": int(qty),
-                    "price": current_price,
-                    "pnl": unrealized_pl,
-                    "pnl_pct": plpc * 100,
-                    "held": held,
-                    "cash": cash,
-                    "portfolio": portfolio,
-                    "order_id": order["order_id"]
-                })
-
-            except Exception as e:
-                log.error(f"Failed to close {symbol}: {e}")
-
-    save_log(daily_log)
-
-
 def mode_close():
     """Close ALL open options positions (EOD)."""
     log.info("=== MODE: CLOSE (options EOD) ===")
@@ -1153,13 +1033,11 @@ def fire_trade_hook(event_type: str, details: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Alpaca Options Trading Bot")
-    parser.add_argument("--mode", choices=["open", "monitor", "close", "intraday"], required=True)
+    parser.add_argument("--mode", choices=["open", "close", "intraday"], required=True)
     args = parser.parse_args()
 
     if args.mode == "open":
         mode_open()
-    elif args.mode == "monitor":
-        mode_monitor()
     elif args.mode == "close":
         mode_close()
     elif args.mode == "intraday":

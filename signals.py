@@ -63,8 +63,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POLITICIANS_LATEST = os.path.join(BASE_DIR, "knowledge", "politicians", "latest.json")
 
 # ── Options signal thresholds ────────────────────────────────────────────────
-MIN_OPTION_VOLUME = 250          # Ignore options with < 250 contracts (noise filter)
-MIN_AGGREGATE_PREMIUM = 50_000   # At least $50K aggregate premium to count
+MIN_OPTION_VOLUME = 500          # Raised from 250 — tighter noise filter
+MIN_AGGREGATE_PREMIUM = 200_000  # Raised from $50K — $200K+ signals institutional intent
 MAX_OTM_PCT = 0.20               # Ignore options more than 20% OTM (lottery tickets)
 NEAR_OTM_MAX_PCT = 0.10          # Near-OTM: within 10% of current price
 SWEEP_VOL_MULTIPLIER = 5.0       # Vol > 5x OI = likely sweep (aggressive buyer)
@@ -371,13 +371,12 @@ def get_news_score(ticker: str):
         top_headline = headlines[0] if headlines else "no headline"
 
         if bull_hits > bear_hits and len(results) >= 3:
-            news_score = min(2, 1 + bull_hits // 3)
+            news_score = 1  # capped at 1 — tie-breaker only, not a primary signal
             news_direction = "LONG"
         elif bear_hits > bull_hits and len(results) >= 3:
-            news_score = min(2, 1 + bear_hits // 3)
+            news_score = 1  # capped at 1 — tie-breaker only
             news_direction = "SHORT"
-        elif len(results) >= 5:
-            news_score = 1  # neutral/mixed news, low weight
+        # neutral/mixed news = 0 (removed noise point)
 
         return news_score, top_headline, news_direction
 

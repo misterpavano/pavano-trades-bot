@@ -18,7 +18,7 @@ MIN_SIGNAL_SCORE = 5        # Only trade if score >= 5
 STOP_LOSS_PCT = -0.50       # -50% on option premium
 TAKE_PROFIT_PCT = 1.00      # +100% on option premium (double up)
 MAX_POSITION_COST = 190     # max per options position — keeps us under $207 balance
-CASH_RESERVE = 0            # no reserve — use full available balance
+CASH_RESERVE = 50           # minimum cash buffer — never go to $0
 MAX_CONTRACT_ASK = 1.90     # skip if ask > $1.90/share ($190/contract) — sized for current balance
 OPTION_DTE_MIN = 7          # min days to expiry
 OPTION_DTE_MAX = 30         # max days to expiry
@@ -29,6 +29,6 @@ SIGNALS_FILE = "/home/pavano/pavano-trades-bot/signals_output.json"
 SIGNALS_EOD_FILE = "/home/pavano/pavano-trades-bot/signals_eod.json"
 
 # Options flow thresholds
-UNUSUAL_VOLUME_MULTIPLIER = 2.0
+UNUSUAL_VOLUME_MULTIPLIER = 5.0  # raised from 2.0 — industry standard for true unusual activity
 MIN_EXPIRY_DAYS = 7
 MAX_EXPIRY_DAYS = 30
