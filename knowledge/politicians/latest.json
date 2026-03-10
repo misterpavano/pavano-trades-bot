@@ -1,8 +1,78 @@
 {
-  "generated_at": "2026-03-04T10:30:08.805065",
+  "generated_at": "2026-03-10T08:45:03.941789",
   "lookback_days": 30,
-  "total_transactions": 6,
-  "tickers_flagged": 0,
-  "source_used": "house_clerk_pdf",
-  "signals": []
+  "total_transactions": 26,
+  "tickers_flagged": 3,
+  "source_used": "quiver_quant",
+  "signals": [
+    {
+      "ticker": "MSFT",
+      "score": 3.0,
+      "politicians": [
+        {
+          "name": "David J. Taylor",
+          "party": "R",
+          "chamber": "Representatives",
+          "amount": "$1,001 - $15,000",
+          "date": "2026-02-26"
+        },
+        {
+          "name": "John Boozman",
+          "party": "R",
+          "chamber": "Senate",
+          "amount": "$1,001 - $15,000",
+          "date": "2026-02-13"
+        },
+        {
+          "name": "David J. Taylor",
+          "party": "R",
+          "chamber": "Representatives",
+          "amount": "$1,001 - $15,000",
+          "date": "2026-02-09"
+        }
+      ],
+      "transaction_count": 3,
+      "unique_politicians": 2,
+      "scanned_at": "2026-03-10T08:45:03.940068"
+    },
+    {
+      "ticker": "AMZN",
+      "score": 1.5,
+      "politicians": [
+        {
+          "name": "David J. Taylor",
+          "party": "R",
+          "chamber": "Representatives",
+          "amount": "$1,001 - $15,000",
+          "date": "2026-02-26"
+        },
+        {
+          "name": "David J. Taylor",
+          "party": "R",
+          "chamber": "Representatives",
+          "amount": "$1,001 - $15,000",
+          "date": "2026-02-09"
+        }
+      ],
+      "transaction_count": 2,
+      "unique_politicians": 1,
+      "scanned_at": "2026-03-10T08:45:03.940098"
+    },
+    {
+      "ticker": "AAPL",
+      "score": 0.5,
+      "politicians": [
+        {
+          "name": "Cleo Fields",
+          "party": "D",
+          "chamber": "Representatives",
+          "amount": "$1,001 - $15,000",
+          "date": "2026-02-12"
+        }
+      ],
+      "transaction_count": 1,
+      "unique_politicians": 1,
+      "scanned_at": "2026-03-10T08:45:03.940109"
+    }
+  ]
 }

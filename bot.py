@@ -721,6 +721,16 @@ def mode_open():
     for signal in signals_to_trade:
         ticker = signal["ticker"]
         direction = signal.get("direction", "LONG")
+        conviction_flag = signal.get("conviction_flag")
+
+        # conviction_flag is the strongest signal — if it contradicts direction, override
+        if conviction_flag == "HIGH_CONVICTION_SHORT" and direction != "SHORT":
+            log.warning(f"{signal['ticker']}: conviction_flag=HIGH_CONVICTION_SHORT overrides direction={direction} → SHORT")
+            direction = "SHORT"
+        elif conviction_flag == "HIGH_CONVICTION_LONG" and direction != "LONG":
+            log.warning(f"{signal['ticker']}: conviction_flag=HIGH_CONVICTION_LONG overrides direction={direction} → LONG")
+            direction = "LONG"
+
         score_val = signal.get("score", 0)
         signals_fired = _signal_labels(signal)
         option_type_label = "CALL" if direction == "LONG" else "PUT"
@@ -832,7 +842,7 @@ def mode_open():
                 f"💵 Cash remaining: ${cash_remaining:.2f}"
             )
             send_telegram(msg)
-            fire_trade_hook("BUY", f"{option_type_label} {ticker} strike={strike} exp={exp_date} qty={qty} @${ask:.2f}/sh")
+            fire_trade_hook("BUY", f"{option_type_label} {ticker} strike={strike} exp={exp_date} qty={qty} @${ask_per_share:.2f}/sh")
             append_trade_event({
                 "type": "options_buy",
                 "underlying": ticker,

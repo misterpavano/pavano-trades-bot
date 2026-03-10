@@ -13,5 +13,35 @@
     "politician_score": 0,
     "won": false,
     "close_reason": "EOD close"
+  },
+  {
+    "date": "2026-03-04",
+    "ticker": "AAPL260318C00272500",
+    "entry": 0,
+    "exit": 1.72,
+    "pnl": -105.0,
+    "pnl_pct": -37.91,
+    "signal_score": 8,
+    "signal_type": "unknown",
+    "options_score": 0,
+    "news_score": 0,
+    "politician_score": 0,
+    "won": false,
+    "close_reason": "EOD close"
+  },
+  {
+    "date": "2026-03-05",
+    "ticker": "AMZN260320P00205000",
+    "entry": 0,
+    "exit": 1.79,
+    "pnl": -62.0,
+    "pnl_pct": -25.73,
+    "signal_score": 8,
+    "signal_type": "unknown",
+    "options_score": 0,
+    "news_score": 0,
+    "politician_score": 0,
+    "won": false,
+    "close_reason": "EOD close"
   }
 ]
