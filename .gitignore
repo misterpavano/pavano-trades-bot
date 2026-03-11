@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.secrets
+*.log
+cache/
 signals_output.json
 trades/*.json
 knowledge/politicians/history.json
