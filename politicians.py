@@ -5,9 +5,12 @@ Fetches congressional trades from Quiver Quant (no API key needed, works from VP
 
 Data sources (tried in order):
   1. Quiver Quant /beta/live/congresstrading (primary — works from VPS, no auth)
-  2. House Clerk PTR PDFs (secondary — 500ing as of 2026-03-09)
-  3. House Stock Watcher S3 (fallback — residential IPs only, 403 from VPS)
-  4. Senate Stock Watcher S3 (fallback — residential IPs only, 403 from VPS)
+  2. House Clerk PTR PDFs (secondary — 500ing since 2026-03-09, still down as of 2026-03-11)
+  3. House Stock Watcher S3 (fallback — 403 from VPS since ~2026-01, residential IPs only)
+  4. Senate Stock Watcher S3 (fallback — 403 from VPS since ~2026-01, residential IPs only)
+
+IMPORTANT: Quiver Quant is the ONLY working data source from VPS as of 2026-03-11.
+If it fails, politician_score degrades to 0 silently. Caching + alerting added to mitigate.
 
 Scoring enhancements:
   - Multi-politician convergence: multiple members buying same ticker = boost
@@ -21,11 +24,24 @@ import os
 import re
 import io
 import time
+import glob
 import zipfile
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+
+# Telegram alerting (for Quiver Quant failures)
+TELEGRAM_CHAT_ID = "-5063061110"  # Pavano Maintenance
+TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+# Caching for Quiver Quant (resilience against transient failures)
+QUIVER_CACHE_DIR = "/home/pavano/scripts/cache"
+QUIVER_CACHE_MAX_AGE_DAYS = 3
+
+# Degraded signal logging
+SIGNAL_DEGRADED_LOG = "/home/pavano/scripts/logs/signal-degraded.log"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 POLITICIANS_DIR = os.path.join(BASE_DIR, "knowledge", "politicians")
@@ -113,6 +129,86 @@ def convergence_bonus(num_politicians):
 
 def make_tx_id(name, ticker, tx_date):
     return f"{name.lower().replace(' ', '_')}_{ticker}_{tx_date}"
+
+
+# ---------------------------------------------------------------------------
+# Alerting, caching, and degraded signal logging (Sprint 5 hardening)
+# ---------------------------------------------------------------------------
+
+def send_quiver_alert(message: str):
+    """Send Telegram alert for Quiver Quant failures."""
+    try:
+        resp = requests.post(
+            TELEGRAM_API,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            timeout=5
+        )
+        log.info(f"Quiver alert sent (status={resp.status_code})")
+    except Exception as e:
+        log.warning(f"Failed to send Quiver alert: {e}")
+
+
+def get_quiver_cache_path(ticker: str = "all") -> str:
+    """Get cache file path for Quiver Quant data."""
+    today = date.today().isoformat()
+    return os.path.join(QUIVER_CACHE_DIR, f"politician-{ticker}-{today}.json")
+
+
+def save_quiver_cache(transactions: list, ticker: str = "all"):
+    """Cache successful Quiver Quant results."""
+    os.makedirs(QUIVER_CACHE_DIR, exist_ok=True)
+    cache_path = get_quiver_cache_path(ticker)
+    try:
+        cache_data = {
+            "cached_at": datetime.now().isoformat(),
+            "transactions": transactions
+        }
+        with open(cache_path, "w") as f:
+            json.dump(cache_data, f)
+        log.info(f"Cached {len(transactions)} Quiver transactions to {cache_path}")
+    except Exception as e:
+        log.warning(f"Failed to cache Quiver data: {e}")
+
+
+def load_quiver_cache(ticker: str = "all") -> tuple:
+    """
+    Load cached Quiver data from last 3 days.
+    Returns (transactions, staleness_note) or (None, None) if no valid cache.
+    """
+    os.makedirs(QUIVER_CACHE_DIR, exist_ok=True)
+    
+    # Look for cache files from last N days
+    for days_ago in range(QUIVER_CACHE_MAX_AGE_DAYS + 1):
+        check_date = (date.today() - timedelta(days=days_ago)).isoformat()
+        cache_path = os.path.join(QUIVER_CACHE_DIR, f"politician-{ticker}-{check_date}.json")
+        
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path) as f:
+                    cache_data = json.load(f)
+                transactions = cache_data.get("transactions", [])
+                cached_at = cache_data.get("cached_at", check_date)
+                staleness = f"STALE ({days_ago}d old, cached {cached_at})" if days_ago > 0 else "fresh"
+                log.info(f"Loaded {len(transactions)} transactions from cache ({staleness})")
+                return transactions, staleness if days_ago > 0 else None
+            except Exception as e:
+                log.warning(f"Failed to load cache {cache_path}: {e}")
+                continue
+    
+    return None, None
+
+
+def log_degraded_signal(ticker: str, reason: str):
+    """Log when politician_score is 0 due to data failure (not legitimately 0)."""
+    os.makedirs(os.path.dirname(SIGNAL_DEGRADED_LOG), exist_ok=True)
+    timestamp = datetime.now().isoformat()
+    log_line = f"{timestamp} | ticker={ticker} | reason={reason}\n"
+    try:
+        with open(SIGNAL_DEGRADED_LOG, "a") as f:
+            f.write(log_line)
+        log.info(f"Logged degraded signal: {ticker} - {reason}")
+    except Exception as e:
+        log.warning(f"Failed to log degraded signal: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +429,15 @@ def normalize_senate(tx):
 # Quiver Quant (primary — works from VPS, no auth required)
 # ---------------------------------------------------------------------------
 
-def fetch_quiver_quant():
-    """Fetch congressional trades from Quiver Quant API (free, no key needed)."""
+def fetch_quiver_quant(ticker_filter: str = None):
+    """
+    Fetch congressional trades from Quiver Quant API (free, no key needed).
+    
+    On success: caches results for resilience.
+    On failure: sends Telegram alert and attempts to load from cache.
+    """
+    cache_key = ticker_filter or "all"
+    
     try:
         resp = requests.get(
             QUIVER_QUANT_URL,
@@ -345,7 +448,29 @@ def fetch_quiver_quant():
         data = resp.json()
         log.info(f"Quiver Quant: {len(data)} total records")
     except Exception as e:
-        log.error(f"Quiver Quant fetch error: {e}")
+        error_msg = str(e)
+        log.error(f"Quiver Quant fetch error: {error_msg}")
+        
+        # ALERT: Quiver Quant is the only working source - this is critical
+        alert_text = (
+            f"⚠️ *Quiver Quant fetch failed*\n\n"
+            f"Error: `{error_msg[:200]}`\n\n"
+            f"Politician score will be 0 unless cache is available.\n"
+            f"This is the ONLY working data source from VPS."
+        )
+        send_quiver_alert(alert_text)
+        
+        # Try to load from cache
+        cached_txs, staleness = load_quiver_cache(cache_key)
+        if cached_txs is not None:
+            log.warning(f"Using cached Quiver data ({staleness})")
+            # Log as degraded if using stale cache
+            if staleness:
+                log_degraded_signal(cache_key, f"Quiver API failed, using {staleness} cache")
+            return cached_txs
+        
+        # No cache available - this will result in score 0
+        log_degraded_signal(cache_key, f"Quiver API failed, no cache available: {error_msg}")
         return []
 
     transactions = []
@@ -356,6 +481,9 @@ def fetch_quiver_quant():
                 continue
             ticker = (tx.get("Ticker") or "").upper().strip()
             if not ticker or ticker == "--":
+                continue
+            # Apply ticker filter if specified
+            if ticker_filter and ticker != ticker_filter.upper():
                 continue
             date_str = tx.get("TransactionDate") or tx.get("ReportDate") or ""
             if not date_str:
@@ -382,6 +510,11 @@ def fetch_quiver_quant():
             continue
 
     log.info(f"Quiver Quant: {len(transactions)} purchase transactions in last {LOOKBACK_DAYS} days")
+    
+    # Cache successful results
+    if transactions:
+        save_quiver_cache(transactions, cache_key)
+    
     return transactions
 
 
@@ -487,6 +620,8 @@ def main():
 
     if not all_normalized:
         log.warning("No transactions available. Options+news signals only for this run.")
+        # Log this as a degraded signal condition - all sources failed
+        log_degraded_signal("ALL", "All data sources failed or returned empty - politician_score will be 0 for all tickers")
         signals = []
     else:
         signals = aggregate_signals(all_normalized)
