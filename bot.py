@@ -35,7 +35,8 @@ from config import (
     STOP_LOSS_PCT, TAKE_PROFIT_PCT,
     MAX_POSITION_COST, CASH_RESERVE, MAX_CONTRACT_ASK,
     OPTION_DTE_MIN, OPTION_DTE_MAX, OTM_PCT,
-    TRADES_DIR, SIGNALS_FILE, SIGNALS_EOD_FILE
+    TRADES_DIR, SIGNALS_FILE, SIGNALS_EOD_FILE,
+    TELEGRAM_BOT_TOKEN
 )
 
 from alpaca.trading.client import TradingClient
@@ -54,7 +55,7 @@ TODAY = date.today().isoformat()
 LOG_FILE = os.path.join(TRADES_DIR, f"{TODAY}.json")
 
 TELEGRAM_CHAT_ID = "-5191423233"
-TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
+# TELEGRAM_BOT_TOKEN imported from config (reads from openclaw.json)
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 ALPACA_HEADERS = {
@@ -863,9 +864,185 @@ def mode_open():
     log.info(f"Open mode complete. {len(daily_log['trades'])} option trades placed.")
 
 
+def _parse_option_symbol(symbol: str) -> dict:
+    """
+    Parse an OCC option symbol like NVDA260318P00175000.
+    Returns dict with: underlying, expiry (date), option_type, strike (float)
+    """
+    import re
+    m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d{8})$", symbol)
+    if not m:
+        return {}
+    underlying, exp_str, opt_type, strike_str = m.groups()
+    expiry = date(2000 + int(exp_str[:2]), int(exp_str[2:4]), int(exp_str[4:6]))
+    strike = int(strike_str) / 1000.0
+    return {
+        "underlying": underlying,
+        "expiry": expiry,
+        "option_type": "CALL" if opt_type == "C" else "PUT",
+        "strike": strike,
+        "dte": (expiry - date.today()).days,
+    }
+
+
+def _get_underlying_price(ticker: str) -> float | None:
+    """Fetch current (or last close) price for an underlying via yfinance."""
+    try:
+        info = yf.Ticker(ticker).fast_info
+        price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
+        return float(price) if price else None
+    except Exception:
+        return None
+
+
+def _find_trade_record(symbol: str, daily_log: dict) -> tuple[dict | None, dict | None, str | None]:
+    """
+    Search today's log and up to 5 prior-day logs for a trade record matching symbol.
+    Returns (trade_record, log_dict, log_filepath).
+    log_filepath is None for today's log.
+    """
+    import glob as _glob
+    for trade in daily_log["trades"]:
+        if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+            return trade, daily_log, None
+
+    log_files = sorted(
+        _glob.glob(os.path.join(TRADES_DIR, "????-??-??.json")), reverse=True
+    )
+    for lf in log_files[:5]:
+        if os.path.basename(lf) == f"{TODAY}.json":
+            continue
+        try:
+            with open(lf) as f:
+                prior_log = json.load(f)
+            for trade in prior_log.get("trades", []):
+                if trade.get("contract_symbol") == symbol and not trade.get("closed"):
+                    return trade, prior_log, lf
+        except Exception:
+            pass
+    return None, None, None
+
+
+def evaluate_eod_position(pos: dict, trade_record: dict | None) -> tuple[bool, str, str]:
+    """
+    Decide whether to close or hold a position at EOD.
+
+    Returns:
+        (should_close: bool, close_type: str, reasoning: str)
+
+    close_type values: "stop_loss" | "take_profit" | "dte_risk" |
+                       "thesis_broken" | "eod_forced" | "hold"
+    """
+    symbol = pos["symbol"]
+    plpc = pos["unrealized_plpc"]        # e.g. -0.33 = -33%
+    unrealized_pl = pos["unrealized_pl"]
+    current_price = pos["current_price"]
+
+    parsed = _parse_option_symbol(symbol)
+    option_type = parsed.get("option_type", "CALL" if "C" in symbol else "PUT")
+    dte = parsed.get("dte", 0)
+    underlying_ticker = parsed.get("underlying", symbol[:4])
+    strike = parsed.get("strike", 0)
+
+    # Pull extra context from trade record if available
+    signal_score = trade_record.get("signal_score", "?") if trade_record else "?"
+    signal_direction = trade_record.get("signal_direction", "") if trade_record else ""
+    top_headline = trade_record.get("top_headline", "") if trade_record else ""
+    dte_at_entry = trade_record.get("dte_at_entry", dte) if trade_record else dte
+
+    # Fetch current underlying price
+    stock_price = _get_underlying_price(underlying_ticker)
+
+    # --- HARD CLOSES (non-negotiable) ---
+
+    if plpc <= -0.50:
+        reasoning = (
+            f"Stop-loss triggered at {plpc*100:.1f}%. Premium cut in half — "
+            f"the market has spoken against this thesis. Signal score was {signal_score}/10."
+        )
+        if top_headline:
+            reasoning += f" Original catalyst: \"{top_headline}\""
+        return True, "stop_loss", reasoning
+
+    if plpc >= 1.00:
+        reasoning = (
+            f"100% profit target hit at +{plpc*100:.1f}%. "
+            f"Taking the double as planned — that's the game."
+        )
+        return True, "take_profit", reasoning
+
+    if dte <= 2:
+        reasoning = (
+            f"Only {dte} DTE remaining. Theta decay is brutal inside 2 days — "
+            f"the contract loses time value faster than the stock can move in our favor. "
+            f"Closing to recover whatever premium is left (${current_price:.2f}/share)."
+        )
+        return True, "dte_risk", reasoning
+
+    # --- THESIS CHECK (requires underlying price) ---
+
+    if stock_price:
+        otm_pct = (stock_price - strike) / stock_price  # positive = stock above strike
+
+        if option_type == "CALL":
+            # Thesis: stock goes UP. Bearish if stock is meaningfully below entry strike area.
+            if otm_pct < -0.05:
+                # Stock is more than 5% below strike — deeply OTM, thesis challenged
+                reasoning = (
+                    f"{underlying_ticker} is at ${stock_price:.2f}, which is "
+                    f"{abs(otm_pct)*100:.1f}% below our ${strike:.0f} strike. "
+                    f"The call is deeply OTM with {dte} DTE. "
+                    f"Bullish thesis not supported by current price action — closing."
+                )
+                return True, "thesis_broken", reasoning
+        else:
+            # PUT — thesis: stock goes DOWN. Challenged if stock is well above strike.
+            if otm_pct > 0.10:
+                # Stock is more than 10% above strike — deeply OTM, thesis challenged
+                reasoning = (
+                    f"{underlying_ticker} is at ${stock_price:.2f}, which is "
+                    f"{otm_pct*100:.1f}% above our ${strike:.0f} put strike. "
+                    f"Bearish thesis not supported — stock is moving against the position. Closing."
+                )
+                return True, "thesis_broken", reasoning
+
+    # --- HOLD DECISION ---
+
+    days_remaining = dte
+    days_held = dte_at_entry - dte
+
+    if stock_price and option_type == "CALL":
+        price_context = (
+            f"{underlying_ticker} at ${stock_price:.2f} vs ${strike:.0f} strike "
+            f"({'ITM' if stock_price > strike else f'{abs((stock_price-strike)/stock_price)*100:.1f}% OTM'})."
+        )
+    elif stock_price and option_type == "PUT":
+        price_context = (
+            f"{underlying_ticker} at ${stock_price:.2f} vs ${strike:.0f} strike "
+            f"({'ITM' if stock_price < strike else f'{abs((stock_price-strike)/stock_price)*100:.1f}% OTM'})."
+        )
+    else:
+        price_context = f"Strike: ${strike:.0f}."
+
+    reasoning = (
+        f"Holding. {price_context} "
+        f"{days_remaining} DTE remaining (held {days_held} day{'s' if days_held != 1 else ''}). "
+        f"P&L: {plpc*100:+.1f}% — within acceptable range, no stop triggered. "
+        f"Signal score was {signal_score}/10"
+    )
+    if top_headline:
+        reasoning += f". Original catalyst still valid: \"{top_headline}\""
+    reasoning += ". Letting the thesis run."
+
+    return False, "hold", reasoning
+
+
 def mode_close():
-    """Close ALL open options positions (EOD)."""
-    log.info("=== MODE: CLOSE (options EOD) ===")
+    """
+    EOD position review — close positions where thesis is broken or risk rules
+    are triggered; hold positions where the signal remains intact.
+    """
+    log.info("=== MODE: CLOSE (options EOD review) ===")
     client = get_client()
 
     positions = get_positions(client)
@@ -874,8 +1051,10 @@ def mode_close():
         return
 
     daily_log = load_today_log()
-
     import glob as _glob
+
+    held_positions = []
+    closed_count = 0
 
     for pos in positions:
         symbol = pos["symbol"]
@@ -884,62 +1063,60 @@ def mode_close():
         plpc = pos["unrealized_plpc"]
         unrealized_pl = pos["unrealized_pl"]
 
-        # Determine option type from symbol
-        option_type_label = "CALL" if "C" in symbol else "PUT"
-        underlying = symbol[:4] if len(symbol) > 4 else symbol
+        parsed = _parse_option_symbol(symbol)
+        option_type_label = parsed.get("option_type", "CALL" if "C" in symbol else "PUT")
+        underlying = parsed.get("underlying", symbol[:4])
 
-        log.info(f"EOD closing {symbol}: {qty}x @ ${current_price:.2f} ({plpc*100:.1f}%)")
+        # Find trade record across logs
+        trade_record, trade_log, trade_lf = _find_trade_record(symbol, daily_log)
 
+        # Evaluate: close or hold?
+        should_close, close_type, reasoning = evaluate_eod_position(pos, trade_record)
+
+        log.info(f"EOD eval {symbol}: {'CLOSE' if should_close else 'HOLD'} ({close_type}) — {reasoning[:80]}...")
+
+        if not should_close:
+            held_positions.append({
+                "symbol": symbol,
+                "underlying": underlying,
+                "option_type": option_type_label,
+                "plpc": plpc,
+                "reasoning": reasoning,
+            })
+            # Log the hold decision
+            if trade_record is not None:
+                trade_record["eod_hold_reason"] = reasoning
+                trade_record["eod_hold_date"] = TODAY
+                if trade_lf:
+                    try:
+                        with open(trade_lf, "w") as f:
+                            json.dump(trade_log, f, indent=2)
+                    except Exception as e:
+                        log.warning(f"Could not update prior log for hold: {e}")
+            save_log(daily_log)
+            continue
+
+        # Execute the close
         try:
             order = sell_option_position(client, symbol, int(qty))
 
-            # Search today's log first, then scan recent logs for prior-day positions
-            found_in_log = False
-            for trade in daily_log["trades"]:
-                if trade.get("contract_symbol") == symbol and not trade.get("closed"):
-                    underlying = trade.get("underlying_ticker", underlying)
-                    option_type_label = trade.get("option_type", option_type_label)
-                    trade["closed"] = True
-                    trade["exit_price"] = current_price
-                    trade["close_reason"] = "EOD close"
-                    trade["pnl"] = unrealized_pl
-                    trade["pnl_pct"] = plpc * 100
-                    trade["closed_at"] = datetime.now().isoformat()
-                    found_in_log = True
-                    break
-
-            if not found_in_log:
-                # Position was opened on a prior day — find and update that log
-                log_files = sorted(
-                    _glob.glob(os.path.join(TRADES_DIR, "????-??-??.json")), reverse=True
-                )
-                for lf in log_files[:5]:
-                    if os.path.basename(lf) == f"{TODAY}.json":
-                        continue
+            # Update trade record
+            if trade_record is not None:
+                trade_record["closed"] = True
+                trade_record["exit_price"] = current_price
+                trade_record["close_reason"] = close_type
+                trade_record["close_reasoning"] = reasoning
+                trade_record["pnl"] = unrealized_pl
+                trade_record["pnl_pct"] = plpc * 100
+                trade_record["closed_at"] = datetime.now().isoformat()
+                if trade_lf:
                     try:
-                        with open(lf) as f:
-                            prior_log = json.load(f)
-                        for trade in prior_log.get("trades", []):
-                            if trade.get("contract_symbol") == symbol and not trade.get("closed"):
-                                underlying = trade.get("underlying_ticker", underlying)
-                                option_type_label = trade.get("option_type", option_type_label)
-                                trade["closed"] = True
-                                trade["exit_price"] = current_price
-                                trade["close_reason"] = "EOD close"
-                                trade["pnl"] = unrealized_pl
-                                trade["pnl_pct"] = plpc * 100
-                                trade["closed_at"] = datetime.now().isoformat()
-                                with open(lf, "w") as f:
-                                    json.dump(prior_log, f, indent=2)
-                                log.info(f"Updated prior-day log {os.path.basename(lf)} for {symbol}")
-                                found_in_log = True
-                                break
-                        if found_in_log:
-                            break
+                        with open(trade_lf, "w") as f:
+                            json.dump(trade_log, f, indent=2)
+                        log.info(f"Updated prior-day log {os.path.basename(trade_lf)} for {symbol}")
                     except Exception as e:
-                        log.warning(f"Could not update prior log {lf}: {e}")
-
-            if not found_in_log:
+                        log.warning(f"Could not update prior log {trade_lf}: {e}")
+            else:
                 log.warning(f"No trade record found for {symbol} in today's or recent logs")
 
             try:
@@ -950,21 +1127,33 @@ def mode_close():
                 cash = portfolio = 0
 
             pnl_sign = "+" if unrealized_pl >= 0 else "-"
-            pnl_pct_sign = "+" if plpc >= 0 else "-"
             pnl_abs = abs(unrealized_pl)
             pnl_pct_abs = abs(plpc * 100)
 
+            # Map close type to emoji + label
+            close_labels = {
+                "stop_loss":     ("🔴", "STOP HIT"),
+                "take_profit":   ("✅", "TARGET HIT"),
+                "dte_risk":      ("⏰", "DTE RISK"),
+                "thesis_broken": ("❌", "THESIS BROKEN"),
+                "eod_forced":    ("🔔", "EOD CLOSE"),
+            }
+            emoji, label = close_labels.get(close_type, ("🔔", "EOD CLOSE"))
+
             msg = (
-                f"🔔 EOD CLOSE — {underlying} {option_type_label}\n"
+                f"{emoji} {label} — {underlying} {option_type_label}\n"
                 f"📋 {symbol}\n"
                 f"💵 Sold @ ${current_price:.2f}/share\n"
-                f"📊 P&L: {pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)\n"
+                f"📊 P&L: {pnl_sign}${pnl_abs:.2f} ({pnl_sign}{pnl_pct_abs:.1f}%)\n"
+                f"💡 Why: {reasoning}\n"
                 f"💵 Cash: ${cash:.2f} | Portfolio: ${portfolio:.2f}"
             )
             send_telegram(msg)
-            fire_trade_hook("EOD CLOSE", f"{option_type_label} {symbol} pnl={pnl_sign}${pnl_abs:.2f} ({pnl_pct_sign}{pnl_pct_abs:.1f}%)")
+            fire_trade_hook(label, f"{option_type_label} {symbol} pnl={pnl_sign}${pnl_abs:.2f} ({pnl_sign}{pnl_pct_abs:.1f}%) reason={close_type}")
             append_trade_event({
                 "type": "eod_close",
+                "close_type": close_type,
+                "reasoning": reasoning,
                 "symbol": symbol,
                 "underlying": underlying,
                 "option_type": option_type_label,
@@ -977,13 +1166,31 @@ def mode_close():
                 "order_id": order["order_id"]
             })
 
+            closed_count += 1
             time.sleep(0.5)
 
         except Exception as e:
             log.error(f"Failed to close {symbol}: {e}")
 
     save_log(daily_log)
-    log.info("All options positions closed.")
+
+    # Send held-positions summary if any
+    if held_positions:
+        held_lines = []
+        for h in held_positions:
+            held_lines.append(
+                f"  {h['underlying']} {h['option_type']} ({h['plpc']*100:+.1f}%): {h['reasoning']}"
+            )
+        hold_msg = (
+            f"📌 HOLDING {len(held_positions)} position(s) overnight — thesis intact:\n"
+            + "\n".join(held_lines)
+        )
+        send_telegram(hold_msg)
+
+    if closed_count == 0 and not held_positions:
+        log.info("No open positions found.")
+    else:
+        log.info(f"EOD review complete — closed {closed_count}, held {len(held_positions)}.")
 
     # Run learning system
     log.info("Running learn.py...")
