@@ -1129,6 +1129,42 @@ def evaluate_eod_position(pos: dict, trade_record: dict | None) -> tuple[bool, s
         )
         return True, "dte_risk", reasoning
 
+    # --- FLOW CONTRADICTION CHECK ---
+    # If smart money flow is pointing the opposite direction from our position,
+    # we don't wait for -50%. Flow is the primary signal — contradicting flow
+    # means the market is telling us we're wrong. Cut early, redeploy smarter.
+    #
+    # Rule: if the top flow strike is more than $10 away from our strike
+    # AND vol/OI at our strike is < 0.5x (nobody buying our level),
+    # AND we're already down > 15%, that's a flow contradiction — exit.
+    if plpc <= -0.15 and dte >= 3:
+        try:
+            flow_map = get_smart_money_flow(underlying_ticker, option_type.lower(), 1, 45)
+            real_flow = [f for f in flow_map.values() if f["volume"] >= 50]
+            if real_flow:
+                real_flow.sort(key=lambda x: x["vol_oi_ratio"], reverse=True)
+                top_flow_strike = real_flow[0]["strike"]
+                top_flow_ratio = real_flow[0]["vol_oi_ratio"]
+
+                # Check vol/OI at our exact strike
+                our_flow = flow_map.get((strike, parsed.get("expiry", exp_date if isinstance(exp_date := parsed.get("expiry"), str) else parsed.get("expiry", date.today()).isoformat())), {})
+                our_ratio = our_flow.get("vol_oi_ratio", 0.0)
+
+                strike_gap = abs(top_flow_strike - strike)
+
+                if strike_gap >= 10 and our_ratio < 0.5 and top_flow_ratio >= 3.0:
+                    reasoning = (
+                        f"Flow contradiction: smart money is at ${top_flow_strike:.0f} "
+                        f"({top_flow_ratio:.1f}x vol/OI) — our ${strike:.0f} strike has "
+                        f"{our_ratio:.2f}x vol/OI (nobody's buying our level). "
+                        f"Gap of ${strike_gap:.0f} between flow and our strike. "
+                        f"Down {plpc*100:.1f}% — cutting before the market takes more. "
+                        f"Flow is the signal. We're on the wrong side of it."
+                    )
+                    return True, "flow_contradiction", reasoning
+        except Exception as e:
+            log.warning(f"Flow contradiction check failed for {symbol}: {e}")
+
     # --- THESIS CHECK (requires underlying price) ---
 
     if stock_price:
@@ -1282,11 +1318,12 @@ def mode_close():
 
             # Map close type to emoji + label
             close_labels = {
-                "stop_loss":     ("🔴", "STOP HIT"),
-                "take_profit":   ("✅", "TARGET HIT"),
-                "dte_risk":      ("⏰", "DTE RISK"),
-                "thesis_broken": ("❌", "THESIS BROKEN"),
-                "eod_forced":    ("🔔", "EOD CLOSE"),
+                "stop_loss":         ("🔴", "STOP HIT"),
+                "take_profit":       ("✅", "TARGET HIT"),
+                "dte_risk":          ("⏰", "DTE RISK"),
+                "thesis_broken":     ("❌", "THESIS BROKEN"),
+                "flow_contradiction":("🌊", "FLOW CONTRADICTION"),
+                "eod_forced":        ("🔔", "EOD CLOSE"),
             }
             emoji, label = close_labels.get(close_type, ("🔔", "EOD CLOSE"))
 

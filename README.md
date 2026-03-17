@@ -59,10 +59,11 @@ signals.py   →  signals_output.json  →  bot.py (open/intraday/close)
 
 ## Stop / Target
 
-- **Stop loss:** -50% of premium paid
+- **Stop loss:** -50% of premium paid (hard floor)
 - **Take profit:** +100% of premium paid (double up)
 - **Time decay rule:** DTE ≤ 3 + P&L ≤ -30% = cut it, time value is gone
 - **Thesis check:** deeply OTM with no price movement toward strike = close
+- **Flow contradiction:** down > 15% AND smart money flow is $10+ away from our strike AND our strike vol/OI < 0.5x AND top flow strike has 3x+ ratio = cut early, don't wait for -50%. Flow is telling us we're wrong. Listen.
 
 ## Modes
 
