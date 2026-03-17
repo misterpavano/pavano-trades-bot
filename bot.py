@@ -78,6 +78,20 @@ def send_telegram(text: str):
         log.warning(f"Telegram send failed: {e}")
 
 
+def _calc_dte(symbol: str):
+    """Parse DTE from OCC option symbol (e.g. PLTR260320P00144000 → 4 days)."""
+    try:
+        import re
+        m = re.search(r'(\d{6})[CP]', symbol)
+        if not m:
+            return None
+        d = m.group(1)
+        exp = date(2000 + int(d[0:2]), int(d[2:4]), int(d[4:6]))
+        return (exp - date.today()).days
+    except Exception:
+        return None
+
+
 def _held_duration(entry_time_iso: str) -> str:
     try:
         entry_dt = datetime.fromisoformat(entry_time_iso)
@@ -223,29 +237,84 @@ def get_option_ask_prices(symbols: list) -> dict:
     return result
 
 
+def get_smart_money_flow(ticker: str, option_type: str, dte_min: int, dte_max: int) -> dict:
+    """
+    Pull options chain from yfinance and return a map of:
+        strike → vol_oi_ratio
+    for all expirations within the DTE window.
+
+    vol/OI ratio >> 1 = new money piling in. That's where smart money is.
+    This is the PRIMARY signal for strike selection — not OTM%, not technicals.
+    """
+    flow_map = {}
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        today_dt = date.today()
+
+        for exp_str in expirations:
+            exp_dt = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            dte = (exp_dt - today_dt).days
+            if not (dte_min <= dte <= dte_max):
+                continue
+
+            try:
+                chain = tk.option_chain(exp_str)
+                df = chain.calls if option_type == "call" else chain.puts
+                for _, row in df.iterrows():
+                    strike = float(row["strike"])
+                    vol = float(row["volume"]) if not (row["volume"] != row["volume"]) else 0
+                    oi = float(row["openInterest"]) if not (row["openInterest"] != row["openInterest"]) else 0
+                    if vol > 0 and oi >= 0:
+                        ratio = vol / (oi + 1)
+                        key = (strike, exp_str)
+                        # Keep highest ratio if same strike appears multiple expirations
+                        if key not in flow_map or ratio > flow_map[key]["vol_oi_ratio"]:
+                            flow_map[key] = {
+                                "strike": strike,
+                                "expiration": exp_str,
+                                "dte": dte,
+                                "volume": int(vol),
+                                "open_interest": int(oi),
+                                "vol_oi_ratio": round(ratio, 2),
+                                "last_price": float(row.get("lastPrice", 0) or 0),
+                            }
+            except Exception as e:
+                log.debug(f"Flow fetch failed for {ticker} {exp_str}: {e}")
+
+    except Exception as e:
+        log.warning(f"Smart money flow fetch failed for {ticker}: {e}")
+
+    return flow_map
+
+
 def select_option_contract(ticker: str, direction: str, stock_price: float) -> dict | None:
     """
     Find the best options contract for a given ticker and direction.
+
+    STRATEGY: Follow the money. We pick the strike where real volume is flooding
+    in relative to open interest (vol/OI ratio). That's where smart money is
+    positioned — not some arbitrary % OTM based on technicals.
+
+    Flow score = vol/OI ratio. Higher = more new money piling into that strike.
+    We pick the highest-flow strike that's affordable and within DTE window.
+
+    Fallback: if no flow data, pick closest affordable strike to ATM.
 
     direction: "LONG" → call, "SHORT" → put
     Returns a dict with contract info or None if nothing suitable found.
     """
     option_type = "call" if direction == "LONG" else "put"
     today_dt = date.today()
-    dte_min = today_dt + timedelta(days=OPTION_DTE_MIN)
-    dte_max = today_dt + timedelta(days=OPTION_DTE_MAX)
+    dte_min_dt = today_dt + timedelta(days=OPTION_DTE_MIN)
+    dte_max_dt = today_dt + timedelta(days=OPTION_DTE_MAX)
 
-    # Target strike: 3% OTM
-    if option_type == "call":
-        target_strike = stock_price * (1 + OTM_PCT)
-    else:
-        target_strike = stock_price * (1 - OTM_PCT)
-
+    # ── Step 1: Get all tradable contracts from Alpaca ────────────────────────
     params = {
         "underlying_symbols": ticker,
         "type": option_type,
-        "expiration_date_gte": dte_min.isoformat(),
-        "expiration_date_lte": dte_max.isoformat(),
+        "expiration_date_gte": dte_min_dt.isoformat(),
+        "expiration_date_lte": dte_max_dt.isoformat(),
         "status": "active",
         "limit": 200
     }
@@ -264,77 +333,110 @@ def select_option_contract(ticker: str, direction: str, stock_price: float) -> d
         data = resp.json()
         contracts = data.get("option_contracts", [])
         if not contracts:
-            log.info(f"No options contracts found for {ticker} ({option_type}, {dte_min} to {dte_max})")
+            log.info(f"No options contracts found for {ticker} ({option_type}, {dte_min_dt} to {dte_max_dt})")
             return None
 
     except Exception as e:
         log.error(f"Failed to fetch options chain for {ticker}: {e}")
         return None
 
-    # Filter tradable contracts near target strike (within 10%)
     tradable = [c for c in contracts if c.get("tradable")]
     if not tradable:
         log.info(f"No tradable contracts for {ticker}")
         return None
 
-    # Only fetch quotes for contracts near the target strike (within 5%)
-    near_strike = [
-        c for c in tradable
-        if abs(float(c["strike_price"]) - target_strike) / stock_price < 0.05
-    ]
-    if not near_strike:
-        # Fallback: sort all tradable by proximity to target strike, take closest 50
-        near_strike = sorted(
-            tradable,
-            key=lambda c: abs(float(c["strike_price"]) - target_strike)
-        )[:50]
-        log.info(f"No contracts within 5% of target strike — using closest 50 by strike proximity")
+    # Build a lookup: (strike, exp_date) → contract
+    contract_lookup = {}
+    for c in tradable:
+        key = (float(c["strike_price"]), c["expiration_date"])
+        contract_lookup[key] = c
 
-    symbols = [c["symbol"] for c in near_strike]
+    # ── Step 2: Pull smart money flow data from yfinance ─────────────────────
+    flow_map = get_smart_money_flow(ticker, option_type, OPTION_DTE_MIN, OPTION_DTE_MAX)
+    log.info(f"Flow data for {ticker}: {len(flow_map)} strikes with vol/OI data")
+
+    # ── Step 3: Get live ask prices for all contracts ─────────────────────────
+    symbols = [c["symbol"] for c in tradable[:100]]  # cap at 100 for API
     ask_prices = get_option_ask_prices(symbols)
 
+    # ── Step 4: Score every contract by flow, filter by price ─────────────────
     candidates = []
-    for c in near_strike:
+
+    for c in tradable:
+        strike = float(c["strike_price"])
+        exp_date = c["expiration_date"]
         sym = c["symbol"]
-        # Use live ask, fallback to close_price
+        exp_dt = datetime.strptime(exp_date, "%Y-%m-%d").date()
+        dte = (exp_dt - today_dt).days
+
+        # Get price
         ask = ask_prices.get(sym)
         if ask is None:
             cp = c.get("close_price")
-            if cp:
-                ask = float(cp)
-            else:
-                continue  # no price data
+            ask = float(cp) if cp else None
+        if ask is None or ask > MAX_CONTRACT_ASK:
+            continue
 
-        if ask > MAX_CONTRACT_ASK:
-            continue  # too expensive per share
+        # Get flow score for this strike/expiry
+        flow_key = (strike, exp_date)
+        flow_data = flow_map.get(flow_key, {})
+        vol_oi_ratio = flow_data.get("vol_oi_ratio", 0.0)
+        flow_volume = flow_data.get("volume", 0)
 
-        strike = float(c["strike_price"])
-        exp_date = datetime.strptime(c["expiration_date"], "%Y-%m-%d").date()
-        dte = (exp_date - today_dt).days
+        # Only count flow as signal if there's meaningful volume (>= 50 contracts)
+        flow_score = vol_oi_ratio if flow_volume >= 50 else 0.0
+
+        # DTE score: prefer 14-21 DTE window (sweet spot for theta/gamma balance)
+        dte_score = 1.0 - abs(dte - 17) / 30.0
 
         candidates.append({
             "symbol": sym,
             "strike": strike,
-            "expiration_date": c["expiration_date"],
+            "expiration_date": exp_date,
             "dte": dte,
             "ask": ask,
             "type": option_type,
-            "name": c.get("name", sym)
+            "name": c.get("name", sym),
+            "vol_oi_ratio": vol_oi_ratio,
+            "flow_volume": flow_volume,
+            "flow_score": flow_score,
+            "dte_score": dte_score,
         })
 
     if not candidates:
         log.info(f"No affordable contracts for {ticker} ({option_type}), ask ≤ ${MAX_CONTRACT_ASK}")
         return None
 
-    # Score candidates: prefer closest to target strike + 14-21 DTE sweet spot
-    def score_contract(c):
-        strike_diff = abs(c["strike"] - target_strike) / stock_price  # normalized
-        dte_diff = abs(c["dte"] - 17) / 30  # prefer ~17 DTE
-        return strike_diff + dte_diff  # lower = better
+    # ── Step 5: Pick the strike. Flow wins. ───────────────────────────────────
+    # If we have real flow data, sort by flow score (vol/OI) descending.
+    # Flow is the primary signal. DTE is tiebreaker.
+    # If no meaningful flow found anywhere, fall back to ATM proximity.
 
-    candidates.sort(key=score_contract)
-    best = candidates[0]
-    log.info(f"Selected {best['symbol']}: strike=${best['strike']}, DTE={best['dte']}, ask=${best['ask']}")
+    has_flow = any(c["flow_score"] > 0 for c in candidates)
+
+    if has_flow:
+        # Flow-first: weight 80% flow, 20% DTE
+        def flow_first_score(c):
+            return c["flow_score"] * 0.8 + c["dte_score"] * 0.2
+        candidates.sort(key=flow_first_score, reverse=True)
+        best = candidates[0]
+        log.info(
+            f"[FLOW] Selected {best['symbol']}: strike=${best['strike']}, "
+            f"DTE={best['dte']}, vol/OI={best['vol_oi_ratio']:.1f}x "
+            f"(vol={best['flow_volume']}), ask=${best['ask']}"
+        )
+    else:
+        # Fallback: no flow data — pick closest to ATM with good DTE
+        def atm_score(c):
+            strike_diff = abs(c["strike"] - stock_price) / stock_price
+            return strike_diff + (1.0 - c["dte_score"])
+        candidates.sort(key=atm_score)
+        best = candidates[0]
+        log.info(
+            f"[FALLBACK/ATM] Selected {best['symbol']}: strike=${best['strike']}, "
+            f"DTE={best['dte']}, no meaningful flow data, ask=${best['ask']}"
+        )
+
     return best
 
 
@@ -455,6 +557,14 @@ def mode_intraday():
             should_close = True
             close_type = "take_profit"
             reason = f"TARGET +100% hit ({plpc*100:.1f}%)"
+        else:
+            # Time-decay rule: DTE ≤ 3 and P&L ≤ -30% → cut it, time value is gone
+            dte = _calc_dte(symbol)
+            if dte is not None and dte <= 3 and plpc <= -0.30:
+                should_close = True
+                close_type = "stop_loss"
+                reason = f"TIME DECAY: {dte} DTE + {plpc*100:.1f}% — cutting losses"
+                log.info(f"  Time-decay rule triggered: {dte} DTE, {plpc*100:.1f}%")
 
         if not should_close:
             continue
@@ -631,6 +741,25 @@ def load_signals():
 def mode_open():
     """Load signals and buy option contracts at market open."""
     log.info("=== MODE: OPEN (options) ===")
+
+    # ── FIX 1: Wait for opening noise to settle ───────────────────────────────
+    # Markets open 9:30am ET. First 15 min = algos fighting each other.
+    # Wait until 9:45am so we enter on actual price action, not the noise.
+    from config import OPEN_ENTRY_DELAY_MINUTES
+    try:
+        import pytz
+        ET = pytz.timezone("America/New_York")
+    except ImportError:
+        import datetime as _dt
+        ET = _dt.timezone(_dt.timedelta(hours=-4))  # EDT fallback
+    et_now = datetime.now(ET)
+    market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
+    entry_window = market_open + timedelta(minutes=OPEN_ENTRY_DELAY_MINUTES)
+    if et_now < entry_window:
+        wait_secs = max(0, (entry_window - et_now).total_seconds())
+        log.info(f"⏳ Waiting {wait_secs:.0f}s for opening noise to settle (entry: 9:{30+OPEN_ENTRY_DELAY_MINUTES:02d}am ET)")
+        time.sleep(wait_secs)
+
     client = get_client()
     data_client = get_data_client()
 
@@ -664,6 +793,27 @@ def mode_open():
                 s["confirmation_note"] = ""
                 tradeable.append(s)
                 log.info(f"Open scan signal added: {s['ticker']}")
+
+    # ── FIX 2: Macro regime filter ────────────────────────────────────────────
+    # SPY + QQQ both down >0.5% = bearish tape → suppress LONG (call) signals
+    # SPY + QQQ both up >0.5%   = bullish tape → suppress SHORT (put) signals
+    # Neutral = no filter applied
+    macro_bias = get_macro_bias(data_client)
+    log.info(f"Macro regime: {macro_bias.upper()}")
+    if macro_bias == "bearish":
+        before = [s["ticker"] for s in tradeable]
+        tradeable = [s for s in tradeable if s.get("direction") != "LONG"]
+        suppressed = [t for t in before if t not in [s["ticker"] for s in tradeable]]
+        if suppressed:
+            log.info(f"Macro filter (BEARISH): suppressed LONG signals → {', '.join(suppressed)}")
+            send_telegram(f"📉 Macro BEARISH — suppressed {len(suppressed)} LONG signal(s): {', '.join(suppressed)}")
+    elif macro_bias == "bullish":
+        before = [s["ticker"] for s in tradeable]
+        tradeable = [s for s in tradeable if s.get("direction") != "SHORT"]
+        suppressed = [t for t in before if t not in [s["ticker"] for s in tradeable]]
+        if suppressed:
+            log.info(f"Macro filter (BULLISH): suppressed SHORT signals → {', '.join(suppressed)}")
+            send_telegram(f"📈 Macro BULLISH — suppressed {len(suppressed)} SHORT signal(s): {', '.join(suppressed)}")
 
     if not tradeable:
         # Gap check rejected everything — do NOT bypass. No trade is the right trade.

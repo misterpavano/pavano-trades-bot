@@ -1,91 +1,114 @@
 # pavano-trades-bot — Options Trading Bot
 
-An automated options trading bot using Alpaca paper trading. Buys OTM call/put options based on signals from unusual options flow, news sentiment, and politician trades.
+Automated options trading on Alpaca paper. One rule above all others:
+
+> **Follow the money. Where smart money flows, we go.**
+
+Forget analyst price targets. Forget technical levels. Forget "expert" opinions.
+The only signal that matters is where real money is actually being placed right now.
+
+---
+
+## The Strategy: Flow First
+
+**Smart money flow = vol/OI ratio.**
+
+When a strike has volume >> open interest, new money is flooding in. Someone knows something, or is making a big directional bet. That's where we want to be — not some arbitrary 3% OTM level we calculated ourselves.
+
+### How strike selection works
+
+1. Signal generated for a ticker (bullish = call, bearish = put)
+2. Pull the live options chain via yfinance for all expirations in our DTE window
+3. Calculate vol/OI ratio for every strike — this tells us where money is actually moving
+4. Pick the strike with the **highest flow concentration** (vol/OI ratio × meaningful volume)
+5. Fallback: if no meaningful flow data, pick closest to ATM with good DTE
+6. Price check: max $2.00/share ask — skip if too expensive
+
+### What we ignore (intentionally)
+
+- Analyst price targets — don't care where "experts" think the stock should go
+- Technical levels, support/resistance — not our game
+- Moving averages — signals.py stripped these out already
+- Sentiment scores alone — only matters if flow confirms it
+
+### What we trust
+
+- **Vol/OI ratio > 2x with volume >= 50 contracts**: real signal
+- **Macro tape** (SPY + QQQ direction): suppress calls in bearish tape, puts in bullish tape
+- **Gap confirmation**: if stock gaps hard against the signal direction at open, skip
+- **DTE**: 14-21 days is the sweet spot — enough time to be right, not too much theta bleed
+
+---
 
 ## Architecture
 
 ```
-signals.py   →  signals_output.json  →  bot.py (open/monitor/close)
-                                              ↓
-                                      Alpaca Options API
-                                              ↓
-                                      Telegram notifications
+signals.py   →  signals_output.json  →  bot.py (open/intraday/close)
+                     +                         ↓
+              yfinance flow data       Alpaca Options API
+              (vol/OI ratios)                  ↓
+                                       Telegram notifications
 ```
 
-## Options-Only Strategy
+## Position Sizing ($500 capital)
 
-This bot trades **options contracts only** — no equity shares.
-
-### Contract Selection Logic
-1. Signal generated for a ticker (bullish = call, bearish = put)
-2. Fetch options chain: 7-30 DTE, active, tradable
-3. Target strike: 3% OTM (calls above spot, puts below spot)
-4. Select contract closest to target strike + 14-21 DTE sweet spot
-5. Price check: max $2.00/share ask ($200/contract) — skip if too expensive
-6. Buy 1-2 contracts depending on budget
-
-### Position Sizing ($500 capital)
 - Max $100 per options position
 - Max 3 positions open at once ($300 max deployed)
 - $200 cash reserve always maintained
 - Skip contracts > $2.00/share ask
 
-### Stop / Target
-- **Stop loss:** -50% of premium paid (options move fast)
+## Stop / Target
+
+- **Stop loss:** -50% of premium paid
 - **Take profit:** +100% of premium paid (double up)
-- **EOD:** close all positions regardless
+- **Time decay rule:** DTE ≤ 3 + P&L ≤ -30% = cut it, time value is gone
+- **Thesis check:** deeply OTM with no price movement toward strike = close
 
 ## Modes
 
 ```bash
-python3 bot.py --mode open     # Execute options trades (run at market open)
-python3 bot.py --mode monitor  # Check SL/TP on open positions (run every 30min)
-python3 bot.py --mode close    # Close all positions EOD (run at 3:45 PM)
+python3 bot.py --mode open      # Execute trades at market open (9:45am ET entry)
+python3 bot.py --mode intraday  # Check SL/TP on open positions
+python3 bot.py --mode close     # EOD review — close or hold with reasoning
 ```
 
-## Setup
+## Alpaca Options API
 
-```bash
-pip install alpaca-py requests
-```
-
-Requires Alpaca paper account with **options trading enabled (Level 2+)**.  
-Current account: **Level 3** ✅
-
-## Alpaca Options API Notes
-
-- Contracts endpoint: `GET /v2/options/contracts?underlying_symbols=AAPL&type=call&expiration_date_gte=...`
-- Symbol format: OCC standard — `AAPL260315C00220000` (AAPL, Mar 15 2026, Call, $220 strike)
+- Contracts: `GET /v2/options/contracts?underlying_symbols=AAPL&type=call&...`
+- Symbol format: OCC standard — `AAPL260315C00220000`
 - Live quotes: `GET https://data.alpaca.markets/v1beta1/options/snapshots?symbols=...&feed=indicative`
-- Orders: same as equities — `POST /v2/orders` with `{"symbol": "AAPL260315C00220000", "qty": "1", "side": "buy", "type": "market", "time_in_force": "day"}`
+- Orders: `POST /v2/orders` with `{"symbol": "AAPL260315C00220000", "qty": "1", "side": "buy", "type": "market", "time_in_force": "day"}`
 - Multiplier: 100 (1 contract = 100 shares exposure)
-
-### Enabling Options on Alpaca Paper Account
-Account must have options_trading_level ≥ 2. To enable:
-1. Log in to alpaca.markets → Paper Trading dashboard
-2. Account → Trading → Options Trading
-3. Complete options agreement and select level
-4. Paper account reflects same level as live account settings
 
 ## Telegram Notifications
 
 **On BUY:**
 ```
-🟢 OPTIONS BUY — AAPL CALL
-📋 Contract: AAPL260315C00220000
-💵 1 contract @ $1.45/share ($145.00 total)
-🎯 Strike: $220 | Exp: 2026-03-15 (14 DTE)
+🟢 OPTIONS BUY — TSLA CALL
+📋 Contract: TSLA260325C00400000
+💵 1 contract @ $1.65/share ($165.00 total)
+🎯 Strike: $400 | Exp: 2026-03-25 (8 DTE)
 📊 Signal: 7.5/10 — options, news
-🛑 Stop: -50% ($0.73/sh) | 🎯 Target: +100% ($2.90/sh)
-💵 Cash remaining: $355.00
+📡 EOD flow — gap +0.8% confirms LONG
+🛑 Stop: -50% ($0.83/sh) | 🎯 Target: +100% ($3.30/sh)
+💵 Cash remaining: $308.00
 ```
 
 **On SELL:**
 ```
-✅ OPTIONS SOLD — AAPL CALL [TARGET HIT]
-📋 AAPL260315C00220000
-💵 Sold @ $2.95/share
-📊 P&L: +$150.00 (+103.4%)
-⏱ Held: 2h 15m
-💵 Cash: $505.00 | Portfolio: $505.00
+✅ TARGET HIT — TSLA CALL
+📋 TSLA260325C00400000
+💵 Sold @ $3.35/share
+📊 P&L: +$170.00 (+103.0%)
+⏱ Held: 1h 42m
+💵 Cash: $478.00 | Portfolio: $478.00
 ```
+
+---
+
+## Key Lessons (hard-won)
+
+- **Analyst PTs are noise.** Flow is signal. We got burned holding TSLA $420C when all the real volume was at $387-$402.
+- **BMNR $30C had 10x the flow of our $24C.** Smart money was right. We were in the wrong strike.
+- **Don't fight the flow.** If vol/OI is dead at your strike, nobody believes in that level. Move.
+- **3% OTM was arbitrary.** We're not smarter than the market. We just follow it.
