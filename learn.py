@@ -59,7 +59,7 @@ def save_json(path, data):
 def update_ticker_md(ticker, trade):
     os.makedirs(TICKERS_DIR, exist_ok=True)
     md_path = os.path.join(TICKERS_DIR, f"{ticker}.md")
-    entry = trade.get("entry_price", 0)
+    entry = trade.get("ask_at_entry") or trade.get("entry_price") or 0
     exit_p = trade.get("exit_price", 0)
     pnl_pct = trade.get("pnl_pct", 0) or 0
     signal_type = determine_signal_type(trade)
@@ -156,7 +156,7 @@ def main():
 
     for trade in closed:
         ticker = trade.get("symbol", "?")
-        entry = trade.get("entry_price", 0)
+        entry = trade.get("ask_at_entry") or trade.get("entry_price") or 0
         exit_p = trade.get("exit_price", 0)
         pnl_pct = trade.get("pnl_pct", 0) or 0
         pnl = trade.get("pnl", 0) or 0

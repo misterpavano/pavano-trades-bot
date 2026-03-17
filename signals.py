@@ -43,6 +43,79 @@ def safe_float(val, default=0.0):
     except Exception:
         return default
 
+
+# ── yfinance Safe Wrappers ───────────────────────────────────────────────────
+# These wrap deprecated/fragile yfinance scraping methods with explicit error
+# handling to prevent silent data corruption. Failures are logged to a dedicated
+# file and degrade gracefully instead of crashing.
+
+YFINANCE_ERROR_LOG = "/home/pavano/scripts/logs/yfinance-errors.log"
+
+
+def _log_yfinance_error(ticker: str, method: str, error: Exception, context: str = ""):
+    """Log yfinance errors to dedicated file with timestamp."""
+    try:
+        os.makedirs(os.path.dirname(YFINANCE_ERROR_LOG), exist_ok=True)
+        timestamp = datetime.now().isoformat()
+        ctx = f" ({context})" if context else ""
+        line = f"[{timestamp}] {ticker} | {method}{ctx} | {type(error).__name__}: {error}\n"
+        with open(YFINANCE_ERROR_LOG, "a") as f:
+            f.write(line)
+    except Exception:
+        pass  # Don't let logging failures cascade
+
+
+def safe_option_chain(tk, exp: str, ticker: str):
+    """
+    Safely fetch option chain for a given expiration.
+    Returns (calls_df, puts_df) or (None, None) on failure.
+    
+    The tk.option_chain() method uses web scraping which breaks frequently.
+    This wrapper ensures failures are logged and don't corrupt signal data.
+    """
+    try:
+        chain = tk.option_chain(exp)
+        return chain.calls, chain.puts
+    except Exception as e:
+        _log_yfinance_error(ticker, "option_chain", e, context=f"exp={exp}")
+        log.warning(f"{ticker}: option_chain({exp}) failed — {type(e).__name__}: {e}")
+        return None, None
+
+
+def safe_calendar(tk, ticker: str):
+    """
+    Safely fetch earnings calendar data.
+    Returns the calendar object or None on failure.
+    
+    The tk.calendar attribute is deprecated and may return inconsistent formats
+    or fail entirely. This wrapper logs failures explicitly.
+    """
+    try:
+        cal = tk.calendar
+        return cal
+    except Exception as e:
+        _log_yfinance_error(ticker, "calendar", e)
+        log.warning(f"{ticker}: calendar fetch failed — {type(e).__name__}: {e}")
+        return None
+
+
+def safe_earnings_history(tk, ticker: str):
+    """
+    Safely fetch historical earnings surprise data.
+    Returns the earnings_history DataFrame or None on failure.
+    
+    The tk.earnings_history attribute is deprecated. This wrapper ensures
+    failures are logged and don't silently corrupt signal scoring.
+    """
+    try:
+        hist = tk.earnings_history
+        return hist
+    except Exception as e:
+        _log_yfinance_error(ticker, "earnings_history", e)
+        log.warning(f"{ticker}: earnings_history fetch failed — {type(e).__name__}: {e}")
+        return None
+
+
 import sys
 import os
 
@@ -186,9 +259,10 @@ def get_options_signal(ticker: str) -> dict:
         for exp, days_out in valid_expiries[:3]:
             dte_mult = dte_score_multiplier(days_out)
             try:
-                chain = tk.option_chain(exp)
-                calls = chain.calls
-                puts = chain.puts
+                calls, puts = safe_option_chain(tk, exp, ticker)
+                if calls is None or puts is None:
+                    log.info(f"{ticker}: skipping expiry {exp} — option_chain unavailable")
+                    continue
 
                 # ── Score calls ──────────────────────────────────────────────
                 for _, row in calls.iterrows():
@@ -301,17 +375,27 @@ def get_options_signal(ticker: str) -> dict:
             sweep_bonus = min(1, sweep_puts * 0.5)
             options_score = min(6, int(base_score + sweep_bonus))
 
-        # ── Put/call premium ratio — standalone conviction factor ────────────
+        # ── FIX 4: Put/call premium ratio — conviction factor (direction-consistent only) ──
+        # Only fire conviction flag when it AGREES with flow-based direction.
+        # Prevents premium-ratio override from contradicting sweep/volume direction.
+        # e.g. BAC 2026-03-11 bug: flow=SHORT but large call OI → conviction=LONG override → wrong trade.
         conviction_flag = None
         if total_put_premium / (total_call_premium + 1) > 10:
-            options_score = min(6, options_score + 2)
-            direction = "SHORT"
-            conviction_flag = "HIGH_CONVICTION_SHORT"
-            log.info(f"{ticker}: HIGH_CONVICTION_SHORT — put premium {total_put_premium:.0f} >> call premium {total_call_premium:.0f}")
+            if direction == "SHORT" or direction is None:
+                options_score = min(6, options_score + 2)
+                direction = "SHORT"
+                conviction_flag = "HIGH_CONVICTION_SHORT"
+                log.info(f"{ticker}: HIGH_CONVICTION_SHORT — put premium {total_put_premium:.0f} >> call premium {total_call_premium:.0f}")
+            else:
+                log.info(f"{ticker}: conviction mismatch — put premium dominant but flow says {direction}, skipping conviction override")
         elif total_call_premium / (total_put_premium + 1) > 10:
-            options_score = min(6, options_score + 2)
-            conviction_flag = "HIGH_CONVICTION_LONG"
-            log.info(f"{ticker}: HIGH_CONVICTION_LONG — call premium {total_call_premium:.0f} >> put premium {total_put_premium:.0f}")
+            if direction == "LONG" or direction is None:
+                options_score = min(6, options_score + 2)
+                direction = "LONG"
+                conviction_flag = "HIGH_CONVICTION_LONG"
+                log.info(f"{ticker}: HIGH_CONVICTION_LONG — call premium {total_call_premium:.0f} >> put premium {total_put_premium:.0f}")
+            else:
+                log.info(f"{ticker}: conviction mismatch — call premium dominant but flow says {direction}, skipping conviction override")
 
         return {
             "ticker": ticker,
@@ -371,23 +455,49 @@ def get_news_score(ticker: str):
         bullish_kw = ["surge", "beat", "rally", "upgrade", "buy", "bullish", "record", "gain", "profit", "strong"]
         bearish_kw = ["crash", "drop", "miss", "downgrade", "sell", "bearish", "loss", "weak", "decline", "cut"]
 
+        # Garbage headline patterns — if the top result looks like this, news score = 0
+        GARBAGE_PATTERNS = [
+            "no headline", "news error", "placeholder", "lorem ipsum",
+            "test headline", "untitled", "breaking news",  # too generic
+        ]
+
+        def is_valid_headline(h: str) -> bool:
+            if not h or len(h.strip()) < 15:
+                return False
+            h_lower = h.lower().strip()
+            if any(p in h_lower for p in GARBAGE_PATTERNS):
+                return False
+            # Must mention something specific — reject pure generic market blurbs
+            # that don't reference the ticker or a real company/event
+            if h_lower in ["market update", "stock market today", "market news"]:
+                return False
+            return True
+
         bull_hits = 0
         bear_hits = 0
-        headlines = []
+        valid_headlines = []
 
         for r in results[:10]:
-            title = (r.get("title", "") + " " + r.get("content", "")).lower()
-            headlines.append(r.get("title", ""))
+            title = r.get("title", "").strip()
+            content = r.get("content", "")
+            if not is_valid_headline(title):
+                continue
+            valid_headlines.append(title)
+            combined = (title + " " + content).lower()
             for kw in bullish_kw:
-                if kw in title:
+                if kw in combined:
                     bull_hits += 1
             for kw in bearish_kw:
-                if kw in title:
+                if kw in combined:
                     bear_hits += 1
+
+        # No valid headlines = no news signal, regardless of keyword hits
+        if not valid_headlines:
+            return 0, "no valid news", None
 
         news_score = 0
         news_direction = None
-        top_headline = headlines[0] if headlines else "no headline"
+        top_headline = valid_headlines[0]
 
         if bull_hits > bear_hits and len(results) >= 3:
             news_score = 1  # capped at 1 — tie-breaker only, not a primary signal
@@ -424,7 +534,7 @@ def get_earnings_data(ticker: str) -> dict:
         earnings_note = ""
 
         try:
-            cal = tk.calendar
+            cal = safe_calendar(tk, ticker)
             if cal is not None:
                 # yfinance returns a dict: {"Earnings Date": [date, ...], ...}
                 raw = None
@@ -436,6 +546,10 @@ def get_earnings_data(ticker: str) -> dict:
                     raw = cal.loc["Earnings Date"].iloc[0]
                 elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
                     raw = cal["Earnings Date"].iloc[0]
+
+                # Guard against NaN values from yfinance calendar
+                if isinstance(raw, float) and math.isnan(raw):
+                    raw = None
 
                 if raw is not None:
                     if isinstance(raw, date) and not isinstance(raw, datetime):
@@ -467,7 +581,7 @@ def get_earnings_data(ticker: str) -> dict:
         earnings_surprise_score = 0
         beat_streak = 0
         try:
-            hist = tk.earnings_history
+            hist = safe_earnings_history(tk, ticker)
             if hist is not None and not hist.empty and "surprisePercent" in hist.columns:
                 # Most recent 4 quarters
                 recent = hist.dropna(subset=["surprisePercent"]).tail(4)
@@ -572,8 +686,48 @@ def get_dynamic_universe(n: int = 30) -> list:
     return combined
 
 
+def _get_macro_regime() -> str:
+    """Check SPY + QQQ to determine market regime. Used to adjust SHORT_SCORE_PENALTY."""
+    try:
+        results = {}
+        for ticker in ["SPY", "QQQ"]:
+            tk = yf.Ticker(ticker)
+            info = tk.fast_info
+            current = info.last_price
+            prev = info.previous_close
+            if current and prev and prev > 0:
+                pct = (current - prev) / prev
+                results[ticker] = pct
+        if len(results) < 2:
+            return "neutral"
+        if all(v < -0.005 for v in results.values()):
+            return "bearish"
+        if all(v > 0.005 for v in results.values()):
+            return "bullish"
+        return "neutral"
+    except Exception as e:
+        log.warning(f"Macro regime check failed: {e}")
+        return "neutral"
+
+
 def scan_all() -> list:
     """Scan dynamic options-active universe and return scored signals."""
+    global SHORT_SCORE_PENALTY
+
+    # ── FIX 3: Dynamic SHORT_SCORE_PENALTY based on macro regime ─────────────
+    # In bearish tape, put flow is directional — lift the 30% haircut.
+    # In bullish tape, apply extra haircut on SHORT signals (more likely hedges).
+    macro_regime = _get_macro_regime()
+    if macro_regime == "bearish":
+        SHORT_SCORE_PENALTY = 1.0   # No haircut — put flow is directional in downtrend
+        log.info("Macro BEARISH — SHORT_SCORE_PENALTY lifted to 1.0 (no put haircut)")
+    elif macro_regime == "bullish":
+        SHORT_SCORE_PENALTY = 0.55  # Extra haircut — short signals in uptrend = mostly hedges
+        log.info("Macro BULLISH — SHORT_SCORE_PENALTY tightened to 0.55")
+    else:
+        SHORT_SCORE_PENALTY = 0.70  # Default — neutral tape
+        log.info("Macro NEUTRAL — SHORT_SCORE_PENALTY = 0.70 (default)")
+
     universe = get_dynamic_universe(n=30)
     log.info(f"Starting scan of {len(universe)} tickers...")
     politician_scores = load_politician_scores()

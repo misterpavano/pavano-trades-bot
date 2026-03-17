@@ -878,6 +878,21 @@ def mode_open():
         signals_fired = _signal_labels(signal)
         option_type_label = "CALL" if direction == "LONG" else "PUT"
 
+        # ── Premium sanity gate ───────────────────────────────────────────────
+        # If we're going LONG (calls) but put premium >> call premium,
+        # smart money is actually buying protection/downside. Don't fight it.
+        # Same logic inverted for SHORT (puts) when calls dominate.
+        call_prem = signal.get("call_premium_est", 0) or 0
+        put_prem = signal.get("put_premium_est", 0) or 0
+        if direction == "LONG" and put_prem > call_prem and (call_prem + put_prem) > 50_000:
+            log.info(f"SKIPPED {ticker}: LONG signal but put premium (${put_prem:,.0f}) > call premium (${call_prem:,.0f}) — flow contradiction")
+            send_telegram(f"⚠️ Skipped {ticker} — LONG signal but put $ (${put_prem/1e6:.1f}M) beats call $ (${call_prem/1e6:.1f}M). Flow says no.")
+            continue
+        if direction == "SHORT" and call_prem > put_prem and (call_prem + put_prem) > 50_000:
+            log.info(f"SKIPPED {ticker}: SHORT signal but call premium (${call_prem:,.0f}) > put premium (${put_prem:,.0f}) — flow contradiction")
+            send_telegram(f"⚠️ Skipped {ticker} — SHORT signal but call $ (${call_prem/1e6:.1f}M) beats put $ (${put_prem/1e6:.1f}M). Flow says no.")
+            continue
+
         # Check if already have a position on this underlying
         already_held = any(ticker in p["symbol"] for p in existing_positions)
         if already_held:
