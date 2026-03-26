@@ -1,14 +1,14 @@
 {
   "unknown": {
     "wins": 0,
-    "losses": 3,
-    "total": 3,
+    "losses": 7,
+    "total": 7,
     "win_rate": 0.0
   },
   "all": {
     "wins": 0,
-    "losses": 3,
-    "total": 3,
+    "losses": 7,
+    "total": 7,
     "win_rate": 0.0
   }
 }

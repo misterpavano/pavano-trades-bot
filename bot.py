@@ -33,6 +33,7 @@ from config import (
     ALPACA_KEY, ALPACA_SECRET, ALPACA_BASE_URL,
     STARTING_CAPITAL, MAX_POSITIONS, MIN_SIGNAL_SCORE,
     STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+    TRAILING_STOP_ACTIVATE, TRAILING_STOP_PCT,
     MAX_POSITION_COST, CASH_RESERVE, MAX_CONTRACT_ASK,
     OPTION_DTE_MIN, OPTION_DTE_MAX, OTM_PCT,
     TRADES_DIR, SIGNALS_FILE, SIGNALS_EOD_FILE,
@@ -40,7 +41,7 @@ from config import (
 )
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -463,15 +464,35 @@ def buy_option_contract(client, contract_symbol: str, qty: int) -> dict:
 
 
 def sell_option_position(client, contract_symbol: str, qty: int) -> dict:
-    """Submit a market sell order for an options position."""
-    req = MarketOrderRequest(
-        symbol=contract_symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.DAY
-    )
-    order = client.submit_order(req)
-    log.info(f"Options order submitted: SELL {qty}x {contract_symbol} — ID={order.id}")
+    """Submit a sell order for an options position.
+    
+    Tries market order first. If rejected (no quote available for illiquid
+    options), falls back to a limit order at $0.01 to close the position.
+    """
+    try:
+        req = MarketOrderRequest(
+            symbol=contract_symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY
+        )
+        order = client.submit_order(req)
+        log.info(f"Options order submitted: SELL {qty}x {contract_symbol} (market) — ID={order.id}")
+    except Exception as e:
+        err_msg = str(e)
+        if "no available quote" in err_msg.lower() or "40310000" in err_msg:
+            log.warning(f"Market order rejected for {contract_symbol} (no quote), retrying as limit @ $0.01")
+            req = LimitOrderRequest(
+                symbol=contract_symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                limit_price=0.01
+            )
+            order = client.submit_order(req)
+            log.info(f"Options order submitted: SELL {qty}x {contract_symbol} (limit $0.01) — ID={order.id}")
+        else:
+            raise
     return {
         "order_id": str(order.id),
         "symbol": contract_symbol,
@@ -544,7 +565,8 @@ def mode_intraday():
                 except Exception:
                     pass
 
-        # Evaluate stop / target
+        # Evaluate stop / target / trailing
+        from trailing_stops import update_high_water, clear_position
         should_close = False
         close_type = ""
         reason = ""
@@ -552,19 +574,32 @@ def mode_intraday():
         if plpc <= STOP_LOSS_PCT:
             should_close = True
             close_type = "stop_loss"
-            reason = f"STOP -50% hit ({plpc*100:.1f}%)"
+            reason = f"STOP {STOP_LOSS_PCT*100:.0f}% hit ({plpc*100:.1f}%)"
         elif plpc >= TAKE_PROFIT_PCT:
             should_close = True
             close_type = "take_profit"
-            reason = f"TARGET +100% hit ({plpc*100:.1f}%)"
+            reason = f"TARGET +{TAKE_PROFIT_PCT*100:.0f}% hit ({plpc*100:.1f}%)"
         else:
-            # Time-decay rule: DTE ≤ 3 and P&L ≤ -30% → cut it, time value is gone
-            dte = _calc_dte(symbol)
-            if dte is not None and dte <= 3 and plpc <= -0.30:
+            # Check trailing stop
+            trail_info = update_high_water(symbol, plpc)
+            if trail_info["trailing_triggered"]:
                 should_close = True
-                close_type = "stop_loss"
-                reason = f"TIME DECAY: {dte} DTE + {plpc*100:.1f}% — cutting losses"
-                log.info(f"  Time-decay rule triggered: {dte} DTE, {plpc*100:.1f}%")
+                close_type = "trailing_stop"
+                reason = (f"TRAILING STOP: peaked at +{trail_info['high_water']*100:.1f}%, "
+                         f"dropped to {plpc*100:.1f}% (trail level: +{trail_info['trail_level']*100:.1f}%)")
+                log.info(f"  Trailing stop triggered: high={trail_info['high_water']*100:.1f}%, now={plpc*100:.1f}%")
+            elif trail_info["high_water"] > plpc and trail_info["trail_level"]:
+                log.info(f"  {symbol}: trailing active — high +{trail_info['high_water']*100:.1f}%, "
+                        f"now {plpc*100:+.1f}%, trail at +{trail_info['trail_level']*100:.1f}%")
+
+            # Time-decay rule: DTE ≤ 3 and P&L ≤ -20% → cut it, time value is gone
+            if not should_close:
+                dte = _calc_dte(symbol)
+                if dte is not None and dte <= 3 and plpc <= -0.20:
+                    should_close = True
+                    close_type = "dte_risk"
+                    reason = f"TIME DECAY: {dte} DTE + {plpc*100:.1f}% — cutting losses"
+                    log.info(f"  Time-decay rule triggered: {dte} DTE, {plpc*100:.1f}%")
 
         if not should_close:
             continue
@@ -596,8 +631,14 @@ def mode_intraday():
             except Exception:
                 cash = portfolio = 0
 
-            emoji = "✅" if close_type == "take_profit" else "🔴"
-            reason_label = "TARGET HIT" if close_type == "take_profit" else "STOP HIT"
+            close_type_map = {
+                "take_profit": ("✅", "TARGET HIT"),
+                "trailing_stop": ("📈", "TRAILING STOP"),
+                "dte_risk": ("⏰", "DTE RISK"),
+                "stop_loss": ("🔴", "STOP HIT"),
+            }
+            emoji, reason_label = close_type_map.get(close_type, ("🔴", "CLOSED"))
+            clear_position(symbol)  # clear trailing stop tracker
             pnl_sign = "+" if unrealized_pl >= 0 else ""
 
             msg = (
@@ -1120,29 +1161,40 @@ def evaluate_eod_position(pos: dict, trade_record: dict | None) -> tuple[bool, s
 
     # --- HARD CLOSES (non-negotiable) ---
 
-    if plpc <= -0.50:
+    if plpc <= STOP_LOSS_PCT:
         reasoning = (
-            f"Stop-loss triggered at {plpc*100:.1f}%. Premium cut in half — "
+            f"Stop-loss triggered at {plpc*100:.1f}%. Premium dropped past {STOP_LOSS_PCT*100:.0f}% — "
             f"the market has spoken against this thesis. Signal score was {signal_score}/10."
         )
         if top_headline:
             reasoning += f" Original catalyst: \"{top_headline}\""
         return True, "stop_loss", reasoning
 
-    if plpc >= 1.00:
+    if plpc >= TAKE_PROFIT_PCT:
         reasoning = (
-            f"100% profit target hit at +{plpc*100:.1f}%. "
-            f"Taking the double as planned — that's the game."
+            f"Profit target hit at +{plpc*100:.1f}%. "
+            f"Taking the +{TAKE_PROFIT_PCT*100:.0f}% as planned."
         )
         return True, "take_profit", reasoning
 
-    if dte <= 2:
+    if dte <= 5:
         reasoning = (
-            f"Only {dte} DTE remaining. Theta decay is brutal inside 2 days — "
+            f"Only {dte} DTE remaining. Theta decay accelerates hard inside 5 days — "
             f"the contract loses time value faster than the stock can move in our favor. "
             f"Closing to recover whatever premium is left (${current_price:.2f}/share)."
         )
         return True, "dte_risk", reasoning
+
+    # --- TRAILING STOP CHECK (EOD) ---
+    from trailing_stops import update_high_water
+    trail_info = update_high_water(symbol, plpc)
+    if trail_info["trailing_triggered"]:
+        reasoning = (
+            f"Trailing stop triggered. Position peaked at +{trail_info['high_water']*100:.1f}%, "
+            f"now at {plpc*100:+.1f}%. Trail level was +{trail_info['trail_level']*100:.1f}%. "
+            f"Locking in gains before they evaporate further."
+        )
+        return True, "trailing_stop", reasoning
 
     # --- FLOW CONTRADICTION CHECK ---
     # If smart money flow is pointing the opposite direction from our position,
@@ -1335,6 +1387,7 @@ def mode_close():
             close_labels = {
                 "stop_loss":         ("🔴", "STOP HIT"),
                 "take_profit":       ("✅", "TARGET HIT"),
+                "trailing_stop":     ("📈", "TRAILING STOP"),
                 "dte_risk":          ("⏰", "DTE RISK"),
                 "thesis_broken":     ("❌", "THESIS BROKEN"),
                 "flow_contradiction":("🌊", "FLOW CONTRADICTION"),

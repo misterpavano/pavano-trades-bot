@@ -4,7 +4,7 @@ politicians.py — Congressional trade tracker
 Fetches congressional trades from Quiver Quant (no API key needed, works from VPS).
 
 Data sources (tried in order):
-  1. Quiver Quant /beta/live/congresstrading (primary — works from VPS, no auth)
+  1. Quiver Quant /beta/live/congresstrading (primary — works from VPS, returning 200 as of 2026-03-11)
   2. House Clerk PTR PDFs (secondary — 500ing since 2026-03-09, still down as of 2026-03-11)
   3. House Stock Watcher S3 (fallback — 403 from VPS since ~2026-01, residential IPs only)
   4. Senate Stock Watcher S3 (fallback — 403 from VPS since ~2026-01, residential IPs only)
@@ -31,9 +31,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from config import TELEGRAM_BOT_TOKEN
+
 # Telegram alerting (for Quiver Quant failures)
 TELEGRAM_CHAT_ID = "-5063061110"  # Pavano Maintenance
-TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 # Caching for Quiver Quant (resilience against transient failures)

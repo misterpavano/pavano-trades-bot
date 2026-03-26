@@ -13,7 +13,7 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(__file__))
 from config import (
     ALPACA_KEY, ALPACA_SECRET, TRADES_DIR,
-    STARTING_CAPITAL, TELEGRAM_GROUP
+    STARTING_CAPITAL, TELEGRAM_GROUP, TELEGRAM_BOT_TOKEN
 )
 
 from alpaca.trading.client import TradingClient
@@ -168,7 +168,7 @@ def build_report(account: dict, daily_log: dict) -> str:
     return report
 
 
-TELEGRAM_BOT_TOKEN = "8787606784:AAFkKAr2oI4uMlTa5FbyE5J_l550w4e1VI0"
+# TELEGRAM_BOT_TOKEN imported from config (reads from openclaw.json)
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 def send_telegram(message: str):

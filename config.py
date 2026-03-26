@@ -49,19 +49,21 @@ WATCHLIST = [
 ]
 
 STARTING_CAPITAL = 1000.0
-MAX_POSITIONS = 5           # max 5 open option positions at once
-MIN_SIGNAL_SCORE = 3        # Lowered from 5 — threshold was too high, nothing ever fired
+MAX_POSITIONS = 4           # max 4 open option positions — concentrated bets, not spray & pray
+MIN_SIGNAL_SCORE = 4        # Raised from 3 — fewer trades, higher conviction only
 OPEN_ENTRY_DELAY_MINUTES = 15  # Wait N minutes after 9:30am before entering — avoids opening noise
 
 # Options-specific config
-STOP_LOSS_PCT = -0.50       # -50% on option premium
-TAKE_PROFIT_PCT = 1.00      # +100% on option premium (double up)
-MAX_POSITION_COST = 190     # max per options position — keeps us under $207 balance
-CASH_RESERVE = 50           # minimum cash buffer — never go to $0
-MAX_CONTRACT_ASK = 1.90     # skip if ask > $1.90/share ($190/contract) — sized for current balance
-OPTION_DTE_MIN = 7          # min days to expiry
-OPTION_DTE_MAX = 30         # max days to expiry
-OTM_PCT = 0.02              # target 2% OTM strikes
+STOP_LOSS_PCT = -0.35       # -35% on option premium (was -50% — too much rope, they hang themselves)
+TAKE_PROFIT_PCT = 0.75      # +75% on option premium (was 100% — take profit before it evaporates)
+TRAILING_STOP_ACTIVATE = 0.40  # activate trailing stop at +40% gain
+TRAILING_STOP_PCT = 0.20    # trail 20% from high — locks in at least +20% if we hit +40%
+MAX_POSITION_COST = 200     # max per options position — 20% of $1000 account
+CASH_RESERVE = 200          # minimum cash buffer — always keep dry powder for opportunities
+MAX_CONTRACT_ASK = 2.00     # skip if ask > $2.00/share ($200/contract)
+OPTION_DTE_MIN = 14         # min days to expiry (was 7 — too short, theta ate us alive)
+OPTION_DTE_MAX = 45         # max days to expiry (was 30 — more room to be right)
+OTM_PCT = 0.03              # target 3% OTM strikes (was 2% — slightly more room)
 
 TRADES_DIR = "/home/pavano/pavano-trades-bot/trades"
 SIGNALS_FILE = "/home/pavano/pavano-trades-bot/signals_output.json"
